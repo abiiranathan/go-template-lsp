@@ -76,6 +76,11 @@
     "configuration": {
       "title": "Go Template LSP",
       "properties": {
+        "gotpl.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable or disable the Go Template LSP extension. When disabled, no analysis, validation, or IntelliSense features are active."
+        },
         "gotpl.goAnalyzerPath": {
           "type": "string",
           "default": "",
@@ -103,7 +108,7 @@
         },
         "gotpl.debounceMs": {
           "type": "number",
-          "default": 1500,
+          "default": 800,
           "description": "Debounce delay in milliseconds before re-validating on file change."
         },
         "gotpl.compress": {

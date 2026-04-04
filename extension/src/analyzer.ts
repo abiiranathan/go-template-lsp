@@ -67,6 +67,24 @@ export class GoAnalyzer {
     }
   }
 
+  /**
+   * Re-run only the template validation step using existing Go analysis.
+   * Much faster than a full analyze when only template files changed.
+   */
+  async reanalyzeTemplates(workspaceRoot: string): Promise<AnalysisResult> {
+    try {
+      const result = await this.sendDaemonRequest<AnalysisResult>(workspaceRoot, 'reanalyzeTemplates', this.buildAnalyzeParams(workspaceRoot));
+      this.outputChannel.appendLine(
+        `[Analyzer] Template reanalysis: ${result.renderCalls?.length ?? 0} render calls, ` +
+        `${result.validationErrors?.length ?? 0} validation errors`
+      );
+      return result;
+    } catch (err) {
+      this.outputChannel.appendLine(`[Analyzer] Template reanalysis failed, falling back to full analyze: ${err}`);
+      return this.analyzeWorkspace(workspaceRoot);
+    }
+  }
+
   async validateTemplate(workspaceRoot: string, absolutePath: string, content: string): Promise<GoTemplateValidationResult> {
     if (!config.validate()) {
       return { validationErrors: [], hasContext: false };

@@ -54,6 +54,27 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(outputChannel, analyzerCollection, editorCollection, namedBlockCollection);
   outputChannel.appendLine('[GoTpl] Extension activated');
 
+  // Check if extension is disabled via settings
+  if (!config.enabled()) {
+    outputChannel.appendLine('[GoTpl] Extension disabled via gotpl.enabled setting.');
+    statusBarItem.text = '$(circle-slash) GoTpl: Disabled';
+    statusBarItem.tooltip = 'Go Template LSP is disabled. Set gotpl.enabled to true to enable.';
+    statusBarItem.show();
+    // Still listen for config changes so user can re-enable at runtime
+    context.subscriptions.push(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (e.affectsConfiguration('gotpl')) {
+          config.reload();
+          if (config.enabled()) {
+            // Reload window to fully re-activate
+            vscode.commands.executeCommand('workbench.action.reloadWindow');
+          }
+        }
+      })
+    );
+    return;
+  }
+
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!workspaceRoot) {
     outputChannel.appendLine('[GoTpl] No workspace folder found');
@@ -85,7 +106,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('gotpl.rebuildIndex', async () => {
-      await rebuildIndex(workspaceRoot);
+      await rebuildIndex(workspaceRoot, 'full');
     }),
 
     vscode.commands.registerCommand('gotpl.showKnowledgeGraph', () => {
@@ -306,21 +327,29 @@ export async function activate(context: vscode.ExtensionContext) {
 
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (isTemplate(doc)) {
-        scheduleRebuild(workspaceRoot);
+        // Template-only change: use fast incremental revalidation
+        scheduleRebuild(workspaceRoot, 'templates-only');
         return;
       }
 
       if (doc.fileName.endsWith('.go') || doc.fileName.endsWith('go.mod') || doc.fileName.endsWith('.json')) {
-        scheduleRebuild(workspaceRoot);
+        // Go source changed: full rebuild required
+        scheduleRebuild(workspaceRoot, 'full');
       }
     })
   );
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('gotpl-analyzer')) {
+      if (e.affectsConfiguration('gotpl')) {
+        config.reload();
+        if (!config.enabled()) {
+          outputChannel.appendLine('[GoTpl] Extension disabled via settings. Reload to take effect.');
+          vscode.commands.executeCommand('workbench.action.reloadWindow');
+          return;
+        }
         outputChannel.appendLine('[GoTpl] Configuration changed, rebuilding index...');
-        scheduleRebuild(workspaceRoot);
+        scheduleRebuild(workspaceRoot, 'full');
       }
     })
   );
@@ -339,10 +368,12 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // ── Initial build ──────────────────────────────────────────────────────────
+  // ── Initial build (non-blocking) ────────────────────────────────────────────
 
-  await rebuildIndex(workspaceRoot);
-  outputChannel.appendLine('[GoTpl] Ready');
+  // Start initial analysis asynchronously so the extension activates immediately.
+  // LSP providers will return empty results until the first build completes.
+  void rebuildIndex(workspaceRoot, 'full');
+  outputChannel.appendLine('[GoTpl] Ready (initial analysis in progress)');
 }
 
 // ── Template detection ─────────────────────────────────────────────────────────
@@ -356,10 +387,11 @@ function isTemplate(doc: vscode.TextDocument): boolean {
 
 // ── Rebuild (full Go analysis) ─────────────────────────────────────────────────
 
-async function rebuildIndex(workspaceRoot: string) {
+async function rebuildIndex(workspaceRoot: string, mode: 'full' | 'templates-only' = 'full') {
   if (!analyzer || !graphBuilder) return;
 
-  statusBarItem.text = '$(sync~spin) GoTpl: Analyzing Go sources...';
+  const label = mode === 'templates-only' ? 'Re-validating templates...' : 'Analyzing Go sources...';
+  statusBarItem.text = `$(sync~spin) GoTpl: ${label}`;
   statusBarItem.show();
 
   const sourceDir: string = config.sourceDir();
@@ -367,7 +399,10 @@ async function rebuildIndex(workspaceRoot: string) {
   const templateBaseDir: string = config.templateBaseDir();
 
   try {
-    const result = await analyzer.analyzeWorkspace(workspaceRoot);
+    const startTime = Date.now();
+    const result = mode === 'templates-only'
+      ? await analyzer.reanalyzeTemplates(workspaceRoot)
+      : await analyzer.analyzeWorkspace(workspaceRoot);
     currentGraph = graphBuilder.build(result);
 
     if (result.errors?.length) {
@@ -382,6 +417,9 @@ async function rebuildIndex(workspaceRoot: string) {
         outputChannel.appendLine('[GoTpl] No render calls found. Check your Go code calls c.Render().');
       }
     }
+
+    const elapsed = Date.now() - startTime;
+    outputChannel.appendLine(`[GoTpl] ${mode === 'templates-only' ? 'Template reanalysis' : 'Full analysis'} completed in ${elapsed}ms`);
 
     // Apply diagnostics from Go analyzer
     const initialValidationErrors = result.validationErrors ?? [];
@@ -635,10 +673,10 @@ async function validateDocument(doc: vscode.TextDocument, requestedVersion = doc
 }
 
 
-function scheduleRebuild(workspaceRoot: string) {
+function scheduleRebuild(workspaceRoot: string, mode: 'full' | 'templates-only' = 'full') {
   const debounceMs = config.debounceMs();
   if (rebuildTimer) clearTimeout(rebuildTimer);
-  rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot), debounceMs);
+  rebuildTimer = setTimeout(() => rebuildIndex(workspaceRoot, mode), debounceMs);
 }
 
 function scheduleValidateDocument(doc: vscode.TextDocument) {

@@ -3,9 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -99,6 +102,18 @@ type daemonState struct {
 	typeRegistry         map[string][]ast.FieldInfo
 	namedBlocks          map[string][]validator.NamedBlockEntry
 	partialTargets       map[string]bool
+
+	// goFingerprint is a hash of all Go file paths + modification times.
+	// If unchanged between analyze calls, we can skip packages.Load entirely.
+	goFingerprint string
+
+	// templateFingerprint is a hash of all template file paths + modification times.
+	// If unchanged, we can skip template re-validation too.
+	templateFingerprint string
+
+	// analysisResult is the raw ast.AnalysisResult kept for incremental re-validation.
+	// When only templates change, we reuse this instead of re-running packages.Load.
+	analysisResult *ast.AnalysisResult
 }
 
 type analyzerDaemon struct {
@@ -113,6 +128,11 @@ type analyzerDaemon struct {
 	templateOverlays map[string]string
 }
 
+// runDaemon starts a JSON-RPC 2.0 server over stdin/stdout that serves
+// analysis, validation, hover, and type-inference requests. The daemon
+// maintains an immutable snapshot of analysis results that is atomically
+// swapped on each analyze call, enabling lock-free reads for concurrent
+// read-only operations.
 func runDaemon(stdin io.Reader, stdout io.Writer) error {
 	server := &analyzerDaemon{
 		templateOverlays: make(map[string]string),
@@ -167,6 +187,9 @@ func writeResponse(writer *bufio.Writer, resp rpcResponse) error {
 	return writer.Flush()
 }
 
+// handle routes an incoming JSON-RPC request to the appropriate method handler.
+// Supported methods: analyze, reanalyzeTemplates, validateTemplate, updateTemplate,
+// clearTemplate, inferExpressionType, getHoverInfo, shutdown.
 func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 	resp := rpcResponse{JSONRPC: "2.0", ID: req.ID}
 	defer func() {
@@ -262,6 +285,20 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 		resp.Result = map[string]bool{"ok": true}
 		return resp
 
+	case "reanalyzeTemplates":
+		var params daemonAnalyzeParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			resp.Error = &rpcError{Code: -32602, Message: fmt.Sprintf("invalid reanalyzeTemplates params: %v", err)}
+			return resp
+		}
+		result, err := d.reanalyzeTemplates(params)
+		if err != nil {
+			resp.Error = &rpcError{Code: -32000, Message: err.Error()}
+			return resp
+		}
+		resp.Result = result
+		return resp
+
 	default:
 		resp.Error = &rpcError{Code: -32601, Message: fmt.Sprintf("unknown method %q", req.Method)}
 		return resp
@@ -274,9 +311,40 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 		baseDir = params.TemplateBaseDir
 	}
 
+	// Compute fingerprints to detect what changed since last analysis.
+	goFP := computeGoFingerprint(params.Dir)
+	tmplFP := computeTemplateFingerprint(baseDir, params.TemplateRoot)
+
+	prev := d.state.Load()
+
+	// Fast path: nothing changed at all — return cached output.
+	if prev != nil && prev.goFingerprint == goFP && prev.templateFingerprint == tmplFP &&
+		prev.dir == params.Dir && prev.templateRoot == params.TemplateRoot &&
+		prev.contextFile == params.ContextFile && prev.validate == params.Validate {
+		return prev.output, nil
+	}
+
+	// Semi-fast path: only templates changed — skip packages.Load, reuse Go analysis.
+	if prev != nil && prev.goFingerprint == goFP && prev.analysisResult != nil &&
+		prev.dir == params.Dir && prev.contextFile == params.ContextFile {
+		return d.buildSnapshotFromResult(prev.analysisResult, params, baseDir, goFP, tmplFP)
+	}
+
+	// Cold path: full analysis required.
 	result := ast.AnalyzeDir(params.Dir, params.ContextFile, ast.DefaultConfig)
 	result.Errors = filterImportErrors(result.Errors)
 
+	return d.buildSnapshotFromResult(&result, params, baseDir, goFP, tmplFP)
+}
+
+// buildSnapshotFromResult runs template validation and builds an immutable
+// daemon state snapshot from an existing AnalysisResult. This is shared by
+// both the full analyze path and the incremental (templates-only) path.
+func (d *analyzerDaemon) buildSnapshotFromResult(
+	result *ast.AnalysisResult,
+	params daemonAnalyzeParams,
+	baseDir, goFP, tmplFP string,
+) (ValidationOutput, error) {
 	validationErrors, namedBlocks, namedBlockErrors := validator.ValidateTemplates(
 		result.RenderCalls,
 		result.FuncMaps,
@@ -286,6 +354,10 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 
 	// Build the render-var index BEFORE Flatten() so field trees are intact.
 	renderVarIndex := buildRenderVarIndex(result.RenderCalls)
+
+	// Clone the result before flattening so we can reuse the un-flattened
+	// version for future incremental re-validation.
+	savedResult := cloneAnalysisResult(result)
 
 	result.Flatten()
 
@@ -315,14 +387,15 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 		typeRegistry:         result.Types,
 		namedBlocks:          namedBlocks,
 		partialTargets:       validator.FindPartialTargets(baseDir, params.TemplateRoot),
+		goFingerprint:        goFP,
+		templateFingerprint:  tmplFP,
+		analysisResult:       savedResult,
 	}
 
 	// Atomic swap: readers instantly see the new state without waiting.
 	d.state.Store(snap)
 
 	// Preserve existing overlays (don't reset on re-analyze).
-	// overlayMu write lock not needed here since analyze is serialised by the
-	// single-threaded RPC loop.
 	if d.templateOverlays == nil {
 		d.overlayMu.Lock()
 		d.templateOverlays = make(map[string]string)
@@ -330,6 +403,99 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 	}
 
 	return output, nil
+}
+
+// reanalyzeTemplates re-runs only the template validation step using the
+// existing Go analysis result. This is much faster than a full analyze when
+// only template files have changed.
+func (d *analyzerDaemon) reanalyzeTemplates(params daemonAnalyzeParams) (ValidationOutput, error) {
+	prev := d.state.Load()
+	if prev == nil || prev.analysisResult == nil {
+		// No previous analysis — fall back to full analyze.
+		return d.analyze(params)
+	}
+
+	baseDir := params.Dir
+	if params.TemplateBaseDir != "" {
+		baseDir = params.TemplateBaseDir
+	}
+
+	goFP := prev.goFingerprint
+	tmplFP := computeTemplateFingerprint(baseDir, params.TemplateRoot)
+
+	return d.buildSnapshotFromResult(prev.analysisResult, params, baseDir, goFP, tmplFP)
+}
+
+// cloneAnalysisResult creates a shallow copy of an AnalysisResult so the
+// original's RenderCalls and FuncMaps are preserved before Flatten() mutates them.
+func cloneAnalysisResult(r *ast.AnalysisResult) *ast.AnalysisResult {
+	clone := &ast.AnalysisResult{
+		Errors: r.Errors,
+		Types:  r.Types,
+	}
+	// Deep-copy render calls since Flatten() strips field trees in-place.
+	clone.RenderCalls = make([]ast.RenderCall, len(r.RenderCalls))
+	for i, rc := range r.RenderCalls {
+		clone.RenderCalls[i] = rc
+		clone.RenderCalls[i].Vars = make([]ast.TemplateVar, len(rc.Vars))
+		copy(clone.RenderCalls[i].Vars, rc.Vars)
+	}
+	clone.FuncMaps = make([]ast.FuncMapInfo, len(r.FuncMaps))
+	copy(clone.FuncMaps, r.FuncMaps)
+	return clone
+}
+
+// computeGoFingerprint builds a hash from all .go file paths and their
+// modification times under dir (excluding vendor, node_modules, testdata).
+func computeGoFingerprint(dir string) string {
+	h := sha256.New()
+	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == "vendor" || name == "node_modules" || name == "testdata" ||
+				strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(path, ".go") {
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			fmt.Fprintf(h, "%s:%d\n", path, info.ModTime().UnixNano())
+		}
+		return nil
+	})
+	// Also include go.sum if present.
+	if info, err := os.Stat(filepath.Join(dir, "go.sum")); err == nil {
+		fmt.Fprintf(h, "go.sum:%d\n", info.ModTime().UnixNano())
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// computeTemplateFingerprint builds a hash from all template file paths and
+// their modification times under baseDir/templateRoot.
+func computeTemplateFingerprint(baseDir, templateRoot string) string {
+	root := filepath.Join(baseDir, templateRoot)
+	h := sha256.New()
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(path, ".html") || strings.HasSuffix(path, ".tmpl") {
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			fmt.Fprintf(h, "%s:%d\n", path, info.ModTime().UnixNano())
+		}
+		return nil
+	})
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (result daemonValidateTemplateResult, err error) {
@@ -561,6 +727,9 @@ func findRenderVarsForTemplate(
 	return "", nil, false
 }
 
+// buildRenderVarIndex creates a template-name → merged TemplateVar list from
+// all render calls. When multiple render calls target the same template, their
+// variable sets are unioned so downstream validation sees the broadest context.
 func buildRenderVarIndex(renderCalls []ast.RenderCall) map[string][]ast.TemplateVar {
 	idx := make(map[string][]ast.TemplateVar, len(renderCalls))
 	seen := make(map[string]map[string]bool, len(renderCalls))

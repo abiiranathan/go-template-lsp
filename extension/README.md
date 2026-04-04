@@ -43,13 +43,25 @@ You can customize the extension via your `settings.json`:
 
 ```json
 {
+  "gotpl.enabled": true,              // Enable or disable the extension entirely
   "gotpl.goAnalyzerPath": "",         // Path to the gotpl analyzer binary. Leave empty to use the bundled binary.
   "gotpl.sourceDir": ".",             // Directory containing your Go source code
   "gotpl.templateRoot": "views",      // Subdirectory where your templates live
-  "gotpl.debounceMs": 500,            // Delay before live validation triggers
+  "gotpl.debounceMs": 800,            // Delay before live validation triggers (default: 800ms)
   "gotpl.validate": true              // Toggle live diagnostics on/off
 }
 ```
+
+### Performance
+
+The extension uses several strategies to keep analysis fast, even on large projects:
+
+*   **Incremental analysis**: When only template files change, the Go analyzer skips the expensive `packages.Load` step and re-validates templates using cached Go type information. This is typically 5-10× faster than a full rebuild.
+*   **File change detection**: The daemon tracks file modification times and skips re-analysis entirely when nothing has changed.
+*   **Async startup**: The extension activates immediately and runs the initial analysis in the background, so VS Code stays responsive.
+*   **Non-blocking providers**: All LSP features (hover, completion, definition) return empty results gracefully if analysis hasn't completed yet.
+
+**Tip**: For very large projects, set `"gotpl.debounceMs": 1500` to reduce how often re-analysis triggers while typing.
 
 ## 💻 CLI Tool
 

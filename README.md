@@ -1,8 +1,12 @@
 # Go Template LSP (Language Server Protocol)
 
+![LOGO](./extension/logo.png)
+
 Bring the power of Go's static typing directly into your HTML templates. 
 
 **Go Template LSP** is a powerful VS Code extension and standalone Go analyzer that provides real-time validation, rich IntelliSense, and seamless navigation for Go `html/template` and `text/template` files.
+
+
 
 If you've ever been frustrated by discovering template typos, missing variables, or type mismatches only *after* compiling and running your server, this extension is for you.
 

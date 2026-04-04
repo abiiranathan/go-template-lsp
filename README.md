@@ -43,13 +43,29 @@ You can customize the extension via your `settings.json`:
 
 ```json
 {
-  "gotpl.goAnalyzerPath": "",         // Path to the gotpl analyzer binary. Leave empty to use the bundled binary.
-  "gotpl.sourceDir": ".",             // Directory containing your Go source code
-  "gotpl.templateRoot": "views",      // Subdirectory where your templates live
-  "gotpl.debounceMs": 500,            // Delay before live validation triggers
-  "gotpl.validate": true              // Toggle live diagnostics on/off
+  "gotpl.enabled": true,                // Enable or disable the extension entirely
+  "gotpl.goAnalyzerPath": "",           // Path to the gotpl analyzer binary. Leave empty to use the bundled binary.
+  "gotpl.sourceDir": ".",               // Go source directory relative to the workspace root
+  "gotpl.templateRoot": "views",        // Root directory for templates, relative to sourceDir
+  "gotpl.templateBaseDir": "",          // Base directory for templates (overrides workspace root)
+  "gotpl.contextFile": "",              // Path to a JSON file with additional context variables (e.g. injected by middleware)
+  "gotpl.debounceMs": 800,              // Delay in ms before live validation triggers (default: 800)
+  "gotpl.validate": true,               // Toggle live diagnostics on/off
+  "gotpl.compress": false,              // Enable GZIP compression from the analyzer
+  "gotpl.showCallSiteErrors": false     // Show errors at partial call sites in addition to the source location
 }
 ```
+
+### Performance
+
+The extension uses several strategies to keep analysis fast, even on large projects:
+
+*   **Daemon mode**: The Go analyzer runs as a persistent JSON-RPC daemon over stdin/stdout, avoiding cold-boot overhead on every keystroke.
+*   **Incremental analysis**: When only template files change, the analyzer skips the expensive `packages.Load` step and re-validates using cached Go type information (5-10× faster).
+*   **File change detection**: The daemon tracks file modification times via content fingerprinting and skips re-analysis entirely when nothing has changed.
+*   **Async startup**: The extension activates immediately and runs initial analysis in the background, so VS Code stays responsive.
+
+**Tip**: For very large projects, set `"gotpl.debounceMs": 1500` to reduce how often re-analysis triggers while typing.
 
 ## 💻 CLI Tool
 

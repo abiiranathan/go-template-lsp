@@ -18,64 +18,115 @@ import (
 	"github.com/abiiranathan/go-template-lsp/gotpl-analyzer/validator"
 )
 
+// rpcRequest represents an incoming JSON-RPC 2.0 request from the extension client.
 type rpcRequest struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int64           `json:"id"`
-	Method  string          `json:"method"`
-	Params  json.RawMessage `json:"params,omitempty"`
+	// JSONRPC is the protocol version string, always "2.0".
+	JSONRPC string `json:"jsonrpc"`
+	// ID is the unique request identifier used to correlate responses.
+	ID int64 `json:"id"`
+	// Method is the RPC method name to invoke (e.g. "analyze", "validateTemplate").
+	Method string `json:"method"`
+	// Params is the raw JSON payload of method-specific parameters.
+	Params json.RawMessage `json:"params,omitempty"`
 }
 
+// rpcResponse represents an outgoing JSON-RPC 2.0 response sent back to the extension client.
 type rpcResponse struct {
-	JSONRPC string    `json:"jsonrpc"`
-	ID      int64     `json:"id"`
-	Result  any       `json:"result,omitempty"`
-	Error   *rpcError `json:"error,omitempty"`
+	// JSONRPC is the protocol version string, always "2.0".
+	JSONRPC string `json:"jsonrpc"`
+	// ID is the request identifier this response corresponds to.
+	ID int64 `json:"id"`
+	// Result is the successful response payload; nil when Error is set.
+	Result any `json:"result,omitempty"`
+	// Error is the error object; nil on success.
+	Error *rpcError `json:"error,omitempty"`
 }
 
+// rpcError represents a JSON-RPC 2.0 error object with a numeric code and human-readable message.
 type rpcError struct {
-	Code    int    `json:"code"`
+	// Code is a numeric error code (e.g. -32700 for parse error, -32601 for method not found).
+	Code int `json:"code"`
+	// Message is a human-readable description of the error.
 	Message string `json:"message"`
 }
 
+// daemonAnalyzeParams holds the parameters for the "analyze" RPC method.
+// Dir is the Go module root, TemplateRoot is the relative path to templates,
+// and ContextFile is an optional rex-analyzer.json providing extra context.
 type daemonAnalyzeParams struct {
-	Dir             string `json:"dir"`
-	TemplateRoot    string `json:"templateRoot"`
+	// Dir is the absolute path to the Go module root directory.
+	Dir string `json:"dir"`
+	// TemplateRoot is the relative path from the base directory to the template folder.
+	TemplateRoot string `json:"templateRoot"`
+	// TemplateBaseDir overrides Dir as the base for resolving TemplateRoot. If empty, Dir is used.
 	TemplateBaseDir string `json:"templateBaseDir"`
-	ContextFile     string `json:"contextFile"`
-	Validate        bool   `json:"validate"`
+	// ContextFile is the optional path to a rex-analyzer.json file providing additional context.
+	ContextFile string `json:"contextFile"`
+	// Validate enables template validation against Go types when true.
+	Validate bool `json:"validate"`
 }
 
+// daemonValidateTemplateParams holds the parameters for the "validateTemplate" RPC method.
+// AbsolutePath is the on-disk path of the template and Content is the current editor buffer.
 type daemonValidateTemplateParams struct {
+	// AbsolutePath is the absolute on-disk path of the template file.
 	AbsolutePath string `json:"absolutePath"`
-	Content      string `json:"content"`
+	// Content is the current editor buffer content for the template.
+	Content string `json:"content"`
 }
 
+// daemonUpdateTemplateParams holds the parameters for the "updateTemplate" RPC method.
+// It stores an in-memory overlay of unsaved template content for the given file.
 type daemonUpdateTemplateParams struct {
+	// AbsolutePath is the absolute on-disk path of the template file to overlay.
 	AbsolutePath string `json:"absolutePath"`
-	Content      string `json:"content"`
+	// Content is the unsaved editor buffer content to store as an overlay.
+	Content string `json:"content"`
 }
 
+// daemonClearTemplateParams holds the parameters for the "clearTemplate" RPC method.
+// It removes the in-memory overlay for the given file, reverting to the on-disk version.
 type daemonClearTemplateParams struct {
+	// AbsolutePath is the absolute path of the template whose overlay should be removed.
 	AbsolutePath string `json:"absolutePath"`
 }
 
+// daemonInferExpressionParams holds the parameters for the "inferExpressionType" RPC method.
+// The extension sends the expression text along with the current scope context so the
+// daemon can resolve the expression's type without re-parsing the entire template.
 type daemonInferExpressionParams struct {
-	Expression  string                     `json:"expression"`
-	Vars        map[string]ast.TemplateVar `json:"vars"`
-	ScopeStack  []validator.ScopeType      `json:"scopeStack"`
+	// Expression is the template expression to resolve (e.g. ".Name", ".Items | len").
+	Expression string `json:"expression"`
+	// Vars is the set of template variables available at the expression's scope.
+	Vars map[string]ast.TemplateVar `json:"vars"`
+	// ScopeStack is the nesting of block scopes (range, with, if) surrounding the expression.
+	ScopeStack []validator.ScopeType `json:"scopeStack"`
+	// BlockLocals contains variables declared by {{$x := ...}} within the current block.
 	BlockLocals map[string]ast.TemplateVar `json:"blockLocals"`
 }
 
+// daemonGetHoverInfoParams holds the parameters for the "getHoverInfo" RPC method.
+// The extension sends the cursor position (1-based line and column) along with the
+// current buffer content so the daemon can return type and documentation information.
 type daemonGetHoverInfoParams struct {
+	// AbsolutePath is the absolute on-disk path of the template file.
 	AbsolutePath string `json:"absolutePath"`
-	Line         int    `json:"line"` // 1-based
-	Col          int    `json:"col"`  // 1-based
-	Content      string `json:"content"`
+	// Line is the 1-based line number of the cursor position.
+	Line int `json:"line"`
+	// Col is the 1-based column number of the cursor position.
+	Col int `json:"col"`
+	// Content is the current editor buffer content for the template.
+	Content string `json:"content"`
 }
 
+// daemonValidateTemplateResult is the response payload for the "validateTemplate" RPC method.
+// ValidationErrors contains any issues found, and HasContext indicates whether render-call
+// variable context was available for the template (if false, validation was skipped).
 type daemonValidateTemplateResult struct {
+	// ValidationErrors is the list of validation issues found in the template.
 	ValidationErrors []validator.ValidationResult `json:"validationErrors"`
-	HasContext       bool                         `json:"hasContext"`
+	// HasContext is true when render-call variable context was found for the template.
+	HasContext bool `json:"hasContext"`
 }
 
 // daemonState is the immutable snapshot of analysis results shared by all
@@ -90,18 +141,29 @@ type daemonValidateTemplateResult struct {
 // read the shared snapshot.  Only the mutable templateOverlays map (written
 // per file save) is still protected by a lightweight RWMutex.
 type daemonState struct {
-	dir          string
-	baseDir      string
+	// dir is the Go module root directory used for analysis.
+	dir string
+	// baseDir is the resolved base directory for template lookup (may differ from dir).
+	baseDir string
+	// templateRoot is the relative path from baseDir to the template folder.
 	templateRoot string
-	contextFile  string
-	validate     bool
-	output       ValidationOutput
+	// contextFile is the path to the optional rex-analyzer.json context file.
+	contextFile string
+	// validate indicates whether template validation was enabled for this snapshot.
+	validate bool
+	// output is the complete validation output returned by the last analyze call.
+	output ValidationOutput
 
+	// renderVarsByTemplate maps template names to their merged set of render-call variables.
 	renderVarsByTemplate map[string][]ast.TemplateVar
-	funcMaps             validator.FuncMapRegistry
-	typeRegistry         map[string][]ast.FieldInfo
-	namedBlocks          map[string][]validator.NamedBlockEntry
-	partialTargets       map[string]bool
+	// funcMaps is the registry of all template function maps discovered in the Go source.
+	funcMaps validator.FuncMapRegistry
+	// typeRegistry maps fully-qualified Go type names to their field information.
+	typeRegistry map[string][]ast.FieldInfo
+	// namedBlocks maps block names to their definition entries across all template files.
+	namedBlocks map[string][]validator.NamedBlockEntry
+	// partialTargets is a set of template names that are invoked as partials (via {{template}}).
+	partialTargets map[string]bool
 
 	// goFingerprint is a hash of all Go file paths + modification times.
 	// If unchanged between analyze calls, we can skip packages.Load entirely.
@@ -116,6 +178,9 @@ type daemonState struct {
 	analysisResult *ast.AnalysisResult
 }
 
+// analyzerDaemon is the main daemon server that processes JSON-RPC requests over
+// stdin/stdout. It maintains an immutable analysis snapshot (swapped atomically)
+// and a mutable template overlay map (protected by a RWMutex).
 type analyzerDaemon struct {
 	// state is replaced atomically on analyze; read-only handlers load it with
 	// atomic.Pointer.Load() which does not block.
@@ -124,7 +189,9 @@ type analyzerDaemon struct {
 	// templateOverlays is the only field that mutates after analyze completes
 	// (via updateTemplate / clearTemplate).  Protected by its own fine-grained
 	// RWMutex instead of the coarse daemon-wide lock.
-	overlayMu        sync.RWMutex
+	// overlayMu protects templateOverlays for concurrent read/write access.
+	overlayMu sync.RWMutex
+	// templateOverlays maps absolute template file paths to their unsaved editor buffer content.
 	templateOverlays map[string]string
 }
 
@@ -176,6 +243,8 @@ func runDaemon(stdin io.Reader, stdout io.Writer) error {
 	}
 }
 
+// writeResponse marshals an rpcResponse as JSON and writes it as a single
+// newline-terminated line to the buffered writer, then flushes immediately.
 func writeResponse(writer *bufio.Writer, resp rpcResponse) error {
 	data, err := json.Marshal(resp)
 	if err != nil {
@@ -305,6 +374,10 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 	}
 }
 
+// analyze performs a full or incremental project analysis. It uses fingerprinting
+// to detect changes: if nothing changed, the cached output is returned immediately;
+// if only templates changed, Go analysis is reused; otherwise a full packages.Load
+// is performed.
 func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, error) {
 	baseDir := params.Dir
 	if params.TemplateBaseDir != "" {
@@ -498,6 +571,9 @@ func computeTemplateFingerprint(baseDir, templateRoot string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// validateTemplate validates a single template file against the current analysis
+// snapshot. It applies any in-memory overlays, resolves the template's render-call
+// variables, and returns validation errors along with whether context was available.
 func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (result daemonValidateTemplateResult, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -590,6 +666,9 @@ func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (
 	}, nil
 }
 
+// updateTemplate stores an in-memory overlay of the template content so that
+// subsequent validateTemplate and getHoverInfo calls use the unsaved buffer
+// instead of the on-disk file.
 func (d *analyzerDaemon) updateTemplate(params daemonUpdateTemplateParams) error {
 	absPath, err := filepath.Abs(params.AbsolutePath)
 	if err != nil {
@@ -604,6 +683,8 @@ func (d *analyzerDaemon) updateTemplate(params daemonUpdateTemplateParams) error
 	return nil
 }
 
+// clearTemplate removes the in-memory overlay for a template file, causing
+// future operations to read from disk.
 func (d *analyzerDaemon) clearTemplate(params daemonClearTemplateParams) error {
 	absPath, err := filepath.Abs(params.AbsolutePath)
 	if err != nil {
@@ -615,6 +696,8 @@ func (d *analyzerDaemon) clearTemplate(params daemonClearTemplateParams) error {
 	return nil
 }
 
+// inferExpressionType resolves the Go type of a template expression (e.g. ".Name",
+// ".Items | len") using the current analysis snapshot's type registry and func maps.
 func (d *analyzerDaemon) inferExpressionType(params daemonInferExpressionParams) (*validator.ExpressionTypeResult, error) {
 	snap := d.state.Load()
 	if snap == nil {
@@ -632,6 +715,8 @@ func (d *analyzerDaemon) inferExpressionType(params daemonInferExpressionParams)
 	), nil
 }
 
+// getHoverInfo returns type and documentation information for the symbol at the
+// given cursor position in a template file, used to power VS Code hover tooltips.
 func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validator.HoverResult, error) {
 	snap := d.state.Load()
 	if snap == nil {
@@ -692,6 +777,10 @@ func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validat
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// findRenderVarsForTemplate looks up the template variables associated with a
+// template file by trying several key normalization strategies (relative path,
+// suffix match, basename match). Returns the matched key, variables, and whether
+// a match was found.
 func findRenderVarsForTemplate(
 	renderVarsByTemplate map[string][]ast.TemplateVar,
 	absPath, baseDir, templateRoot string,
@@ -750,6 +839,8 @@ func buildRenderVarIndex(renderCalls []ast.RenderCall) map[string][]ast.Template
 	return idx
 }
 
+// cloneRegistry creates a shallow copy of the named block registry so that
+// overlay mutations do not affect the shared immutable snapshot.
 func cloneRegistry(in map[string][]validator.NamedBlockEntry) map[string][]validator.NamedBlockEntry {
 	out := make(map[string][]validator.NamedBlockEntry, len(in))
 	for key, entries := range in {
@@ -758,6 +849,8 @@ func cloneRegistry(in map[string][]validator.NamedBlockEntry) map[string][]valid
 	return out
 }
 
+// cloneTemplateOverlays creates a shallow copy of the template overlay map
+// so that reads under RLock can safely iterate without holding the lock.
 func cloneTemplateOverlays(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
 	for key, value := range in {
@@ -766,6 +859,8 @@ func cloneTemplateOverlays(in map[string]string) map[string]string {
 	return out
 }
 
+// applyTemplateOverlays updates the named block registry with in-memory template
+// content from overlays, replacing any existing entries for the same file paths.
 func applyTemplateOverlays(registry map[string][]validator.NamedBlockEntry, overlays map[string]string, baseDir, templateRoot string) {
 	templateBase := filepath.Join(baseDir, templateRoot)
 	for absolutePath, content := range overlays {
@@ -777,6 +872,9 @@ func applyTemplateOverlays(registry map[string][]validator.NamedBlockEntry, over
 	}
 }
 
+// replaceRegistryEntriesForFile removes all existing named block entries for a
+// file from the registry, then re-extracts named templates from the new content
+// and adds them back along with a whole-file entry.
 func replaceRegistryEntriesForFile(registry map[string][]validator.NamedBlockEntry, absolutePath, content, templatePath string) {
 	normalizedPath := normalizePath(absolutePath)
 	for name, entries := range registry {
@@ -805,6 +903,8 @@ func replaceRegistryEntriesForFile(registry map[string][]validator.NamedBlockEnt
 	})
 }
 
+// registryEntriesForFile returns all named block entries in the registry whose
+// absolute path matches the given file, used to find blocks defined in a template.
 func registryEntriesForFile(registry map[string][]validator.NamedBlockEntry, absolutePath string) []validator.NamedBlockEntry {
 	normalizedPath := normalizePath(absolutePath)
 	entries := make([]validator.NamedBlockEntry, 0)
@@ -821,13 +921,20 @@ func registryEntriesForFile(registry map[string][]validator.NamedBlockEntry, abs
 // dedupKey is a struct used to identify unique validation errors for deduplication purposes.
 // Since all fields are comparable, we can use this as a key in a map without memory allocation.
 type dedupKey struct {
+	// Template is the template file path where the error occurred.
 	Template string
-	Line     int
-	Column   int
+	// Line is the 1-based line number of the error.
+	Line int
+	// Column is the 1-based column number of the error.
+	Column int
+	// Variable is the variable name involved in the error.
 	Variable string
-	Message  string
+	// Message is the error message text.
+	Message string
 }
 
+// dedupeValidationErrors removes duplicate validation errors by keying on
+// template, line, column, variable, and message.
 func dedupeValidationErrors(in []validator.ValidationResult) []validator.ValidationResult {
 	seen := make(map[dedupKey]bool, len(in))
 	out := make([]validator.ValidationResult, 0, len(in))
@@ -842,10 +949,14 @@ func dedupeValidationErrors(in []validator.ValidationResult) []validator.Validat
 	return out
 }
 
+// normalizePath returns a cleaned, lowercased version of a file path for
+// case-insensitive comparison.
 func normalizePath(value string) string {
 	return filepath.Clean(strings.ToLower(value))
 }
 
+// normalizeTemplateKey returns a cleaned, forward-slash-separated template key
+// with any leading "./" prefix stripped, for consistent map lookups.
 func normalizeTemplateKey(value string) string {
 	cleaned := filepath.ToSlash(filepath.Clean(value))
 	return strings.TrimPrefix(cleaned, "./")

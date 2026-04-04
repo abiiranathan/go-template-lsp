@@ -53,6 +53,12 @@ export interface GoValidationError {
   goLine?: number;  // line number of the c.Render() call
   templateNameStartCol?: number;
   templateNameEndCol?: number;
+  /** Template file where the error actually originates (before relocation to call site). */
+  sourceTemplate?: string;
+  /** Line in sourceTemplate where the error originates. */
+  sourceLine?: number;
+  /** Column in sourceTemplate where the error originates. */
+  sourceColumn?: number;
 }
 
 

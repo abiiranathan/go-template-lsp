@@ -78,6 +78,19 @@ export class KnowledgeGraphBuilder {
         this.statusBarItem.hide();
     }
 
+    /**
+     * Convert an absolute Go file path to the relative path used in render
+     * calls (relative to workspaceRoot/sourceDir).  Returns null if the file
+     * is not under the source directory.
+     */
+    getRelativeGoFile(absolutePath: string): string | null {
+        const sourceDir: string = config.sourceDir();
+        const sourceDirAbs = path.resolve(this.workspaceRoot, sourceDir);
+        const rel = path.relative(sourceDirAbs, absolutePath);
+        if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+        return rel.replace(/\\/g, '/');
+    }
+
     private getTemplateBase(): string {
         const sourceDir: string = config.sourceDir();
         const templateBaseDir: string = config.templateBaseDir();

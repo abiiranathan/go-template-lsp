@@ -60,6 +60,11 @@ func validateTemplateCallWithRegistry(
 				tmplName, e.Template, e.Message,
 			)
 			if e.Template != templateName {
+				// Preserve the original error location so the editor can
+				// navigate directly to the source of the bug.
+				e.SourceTemplate = e.Template
+				e.SourceLine = e.Line
+				e.SourceColumn = e.Column
 				e.Template = templateName
 				e.Line = actualLineNum
 				e.Column = col

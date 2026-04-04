@@ -120,6 +120,11 @@
           "type": "boolean",
           "default": true,
           "description": "Validate variables passed into the context and template names"
+        },
+        "gotpl.showCallSiteErrors": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show validation errors at partial/named-block call sites in addition to the actual source location. When false, errors only appear where the bug is, with call sites shown as related information."
         }
       }
     }

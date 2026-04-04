@@ -190,21 +190,26 @@ export class DefinitionProvider {
 
     /**
      * Returns the definition location when the cursor is on a Render() template
-     * path string inside a Go source file.  Returns null otherwise.
+     * path string inside a Go source file.  Handles both string literals and
+     * variable-based template names by falling back to the knowledge graph's
+     * render call index.
      */
     getTemplateDefinitionFromGo(
         document: vscode.TextDocument,
         position: vscode.Position
     ): vscode.Location | null {
         const line = document.lineAt(position.line).text;
-        const renderRegex = /\.Render\s*\(\s*"([^"]+)"/g;
+
+        // 1. Try matching string literals: .Render("template.html", ...) or
+        //    ExecuteTemplate(w, "template.html", ...)
+        const renderRegex = /(?:\.Render|ExecuteTemplate)\s*\([^"]*"([^"]+)"/g;
         let match: RegExpExecArray | null;
         while ((match = renderRegex.exec(line)) !== null) {
             const templatePath = match[1];
-            const matchStart = match.index + '.Render("'.length;
+            const nameStart = match.index + match[0].indexOf('"') + 1;
             if (
-                position.character >= matchStart &&
-                position.character <= matchStart + templatePath.length
+                position.character >= nameStart &&
+                position.character <= nameStart + templatePath.length
             ) {
                 const absPath = this.graphBuilder.resolveTemplatePath(templatePath);
                 if (absPath) {
@@ -214,6 +219,26 @@ export class DefinitionProvider {
                 }
             }
         }
+
+        // 2. Fall back to the knowledge graph: if the cursor is on a line that
+        //    has a known render call (even via a variable), resolve the template.
+        const relGoFile = this.graphBuilder.getRelativeGoFile(document.uri.fsPath);
+        if (relGoFile) {
+            const goLine1 = position.line + 1; // render calls use 1-based lines
+            for (const [, ctx] of this.graphBuilder.getGraph().templates) {
+                for (const rc of ctx.renderCalls) {
+                    if (rc.file === relGoFile && rc.line === goLine1) {
+                        const absPath = this.graphBuilder.resolveTemplatePath(rc.template);
+                        if (absPath) {
+                            return new vscode.Location(
+                                vscode.Uri.file(absPath), new vscode.Position(0, 0)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         return null;
     }
 

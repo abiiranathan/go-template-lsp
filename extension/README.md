@@ -43,12 +43,16 @@ You can customize the extension via your `settings.json`:
 
 ```json
 {
-  "gotpl.enabled": true,              // Enable or disable the extension entirely
-  "gotpl.goAnalyzerPath": "",         // Path to the gotpl analyzer binary. Leave empty to use the bundled binary.
-  "gotpl.sourceDir": ".",             // Directory containing your Go source code
-  "gotpl.templateRoot": "views",      // Subdirectory where your templates live
-  "gotpl.debounceMs": 800,            // Delay before live validation triggers (default: 800ms)
-  "gotpl.validate": true              // Toggle live diagnostics on/off
+  "gotpl.enabled": true,                // Enable or disable the extension entirely
+  "gotpl.goAnalyzerPath": "",           // Path to the gotpl analyzer binary. Leave empty to use the bundled binary.
+  "gotpl.sourceDir": ".",               // Go source directory relative to the workspace root
+  "gotpl.templateRoot": "views",        // Root directory for templates, relative to sourceDir
+  "gotpl.templateBaseDir": "",          // Base directory for templates (overrides workspace root)
+  "gotpl.contextFile": "",              // Path to a JSON file with additional context variables (e.g. injected by middleware)
+  "gotpl.debounceMs": 800,              // Delay in ms before live validation triggers (default: 800)
+  "gotpl.validate": true,               // Toggle live diagnostics on/off
+  "gotpl.compress": false,              // Enable GZIP compression from the analyzer
+  "gotpl.showCallSiteErrors": false     // Show errors at partial call sites in addition to the source location
 }
 ```
 

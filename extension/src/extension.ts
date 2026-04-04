@@ -542,8 +542,20 @@ async function applyAnalyzerDiagnostics(
   analyzerCollection.clear();
   const contextFile: string = config.contextFile();
   const issuesByFile = new Map<string, vscode.Diagnostic[]>();
+  const showCallSite = config.showCallSiteErrors();
+
+  // When showCallSiteErrors is off, deduplicate source-location errors that
+  // originate from the same bug but appear once per call site.
+  const seenSourceErrors = new Set<string>();
 
   for (const err of validationErrors) {
+    // If this error was relocated from a partial and we're suppressing call-site
+    // duplicates, only emit the source-location diagnostic once.
+    if (err.sourceTemplate && !showCallSite) {
+      const dedupeKey = `${err.sourceTemplate}:${err.sourceLine}:${err.sourceColumn}:${err.variable}`;
+      if (seenSourceErrors.has(dedupeKey)) continue;
+      seenSourceErrors.add(dedupeKey);
+    }
     let diagnosticFilePath: string;
     let diagnosticLine: number;
     let diagnosticCol: number;
@@ -590,23 +602,64 @@ async function applyAnalyzerDiagnostics(
       const baseDir = templateBaseDir
         ? path.join(workspaceRoot, templateBaseDir)
         : path.join(workspaceRoot, sourceDir);
-      diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
 
-      diagnosticLine = Math.max(0, err.line - 1);
-      diagnosticCol = Math.max(0, err.column - 1);
-      diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
+      // When sourceTemplate is set, the error originates inside a named block
+      // or partial but has been relocated to the call site. Place the primary
+      // diagnostic at the actual source location so "Go to Problem" jumps to
+      // the real bug, and add the call site as related information.
+      if (err.sourceTemplate && err.sourceLine) {
+        const sourceFilePath = path.join(baseDir, templateRoot, err.sourceTemplate);
+        const sourceLine = Math.max(0, err.sourceLine - 1);
+        const sourceCol = Math.max(0, (err.sourceColumn ?? 1) - 1);
+        const sourceEndCol = sourceCol + (err.variable?.length || 1);
 
-      if (err.goFile) {
-        const goFileAbs = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
+        diagnosticFilePath = sourceFilePath;
+        diagnosticLine = sourceLine;
+        diagnosticCol = sourceCol;
+        diagnosticEndCol = sourceEndCol;
+
+        // The call site (where the {{ template }} invocation lives) as related info
+        const callSitePath = path.join(baseDir, templateRoot, err.template);
         relatedInfo = [
           new vscode.DiagnosticRelatedInformation(
             new vscode.Location(
-              vscode.Uri.file(goFileAbs),
-              new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+              vscode.Uri.file(callSitePath),
+              new vscode.Position(Math.max(0, err.line - 1), Math.max(0, err.column - 1))
             ),
-            'Variable passed from here'
+            `Referenced from ${err.template}`
           ),
         ];
+
+        if (err.goFile) {
+          const goFileAbs = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
+          relatedInfo.push(
+            new vscode.DiagnosticRelatedInformation(
+              new vscode.Location(
+                vscode.Uri.file(goFileAbs),
+                new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+              ),
+              'Variable passed from here'
+            )
+          );
+        }
+      } else {
+        diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
+        diagnosticLine = Math.max(0, err.line - 1);
+        diagnosticCol = Math.max(0, err.column - 1);
+        diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
+
+        if (err.goFile) {
+          const goFileAbs = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
+          relatedInfo = [
+            new vscode.DiagnosticRelatedInformation(
+              new vscode.Location(
+                vscode.Uri.file(goFileAbs),
+                new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+              ),
+              'Variable passed from here'
+            ),
+          ];
+        }
       }
     }
 
@@ -725,7 +778,14 @@ async function validateOpenTemplateDocuments(excludeDocKey?: string) {
 function diagnosticsFromValidationErrors(errors: GoValidationError[]): vscode.Diagnostic[] {
   if (!errors) return [];
 
-  return errors.map(err => {
+  // When showCallSiteErrors is off, drop errors that were relocated from a
+  // named block/partial to the call site — the source-location diagnostic
+  // (from the full rebuild) already covers them.
+  const filtered = config.showCallSiteErrors()
+    ? errors
+    : errors.filter(err => !err.sourceTemplate);
+
+  return filtered.map(err => {
     const line = Math.max(0, err.line - 1);
     const col = Math.max(0, err.column - 1);
     const range = new vscode.Range(line, col, line, col + (err.variable?.length || 1));

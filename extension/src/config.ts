@@ -63,6 +63,12 @@ class Config {
     validate(): boolean {
         return this.get<boolean>('validate') ?? true;
     }
+
+    /** Whether to also show errors at partial/named-block call sites. When false (default),
+     *  errors are only shown at the actual source location with call sites as related info. */
+    showCallSiteErrors(): boolean {
+        return this.get<boolean>('showCallSiteErrors') ?? false;
+    }
 }
 
 export const config = new Config();

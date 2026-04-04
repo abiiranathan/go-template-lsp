@@ -35,6 +35,17 @@ type ValidationResult struct {
 
 	// TemplateNameEndCol is the ending column of the template name literal in the Go file, if applicable.
 	TemplateNameEndCol int `json:"templateNameEndCol,omitempty"`
+
+	// SourceTemplate is the template file where the error actually originates,
+	// before relocation to a call site. Set when an error inside a named block
+	// or partial is reported at the calling template instead.
+	SourceTemplate string `json:"sourceTemplate,omitempty"`
+
+	// SourceLine is the line number in SourceTemplate where the error originates.
+	SourceLine int `json:"sourceLine,omitempty"`
+
+	// SourceColumn is the column number in SourceTemplate where the error originates.
+	SourceColumn int `json:"sourceColumn,omitempty"`
 }
 
 // ScopeType represents the contextual scope within a template, tracking available variables and their types.

@@ -1,0 +1,4 @@
+{
+    "gotpl.templateRoot": "templates",
+    "gotpl.contextFile": "rex.json"
+}

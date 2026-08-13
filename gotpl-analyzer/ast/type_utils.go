@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"strings"
+	"sync"
 )
 
 // getASTKey generates a base identifier for a named type to look up docs.
@@ -20,6 +21,8 @@ func getASTKey(named *types.Named) string {
 	return obj.Name()
 }
 
+var typeStrCache sync.Map // types.Type -> string
+
 // normalizeTypeStr makes type strings readable by replacing full import paths
 // with their package names, while preserving the package qualifier.
 // Example: "github.com/user/pkg.PatientPayments" → "views.PatientPayments"
@@ -28,9 +31,17 @@ func normalizeTypeStr(t types.Type) string {
 	if t == nil {
 		return ""
 	}
-	return types.TypeString(t, func(pkg *types.Package) string {
-		return pkg.Name() // keep short package name, drop import path
+
+	if val, ok := typeStrCache.Load(t); ok {
+		return val.(string)
+	}
+
+	str := types.TypeString(t, func(pkg *types.Package) string {
+		return pkg.Name()
 	})
+
+	typeStrCache.Store(t, str)
+	return str
 }
 
 // getElementType extracts the element type from a slice or array type.

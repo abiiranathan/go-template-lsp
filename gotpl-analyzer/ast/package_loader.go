@@ -19,11 +19,11 @@ import (
 //
 // Performance: Skips vendor and generated code directories to reduce processing time.
 func mergeTypeInfo(pkgs []*packages.Package, result *AnalysisResult) (*types.Info, []*goast.File) {
-	// Pre-calculate total sizes to avoid map growth
 	totalTypes, totalDefs, totalUses := 0, 0, 0
+
+	// Only count and merge packages that actually have AST syntax loaded (application packages)
 	for _, pkg := range pkgs {
-		// Skip vendor and generated code for performance
-		if shouldSkipPackage(pkg.PkgPath) {
+		if len(pkg.Syntax) == 0 || shouldSkipPackage(pkg.PkgPath) {
 			continue
 		}
 
@@ -44,10 +44,11 @@ func mergeTypeInfo(pkgs []*packages.Package, result *AnalysisResult) (*types.Inf
 	// Estimate file count
 	allFiles := make([]*goast.File, 0, totalTypes/10+len(pkgs))
 
-	// Merge all package data
 	for _, pkg := range pkgs {
-		// Skip vendor and generated code
-		if shouldSkipPackage(pkg.PkgPath) {
+		// Crucial performance optimization:
+		// We only need TypesInfo for packages with AST syntax (our app code).
+		// Dependencies don't have AST nodes in `pkg.Syntax`, so merging their TypesInfo is 100% wasted work.
+		if len(pkg.Syntax) == 0 || shouldSkipPackage(pkg.PkgPath) {
 			continue
 		}
 

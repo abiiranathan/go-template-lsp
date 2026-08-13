@@ -8,19 +8,6 @@ import (
 	"sync"
 )
 
-// collectFuncScopesOptimized efficiently collects template operations from
-// all function and variable declaration scopes using concurrent processing.
-//
-// Algorithm:
-// 1. Phase 1: Identify all relevant AST nodes (functions, variables)
-// 2. Phase 2: Process nodes concurrently using worker pool
-// 3. Each worker processes a chunk of nodes independently
-// 4. Results are aggregated from all workers
-//
-// Concurrency model:
-// - One worker per CPU core (maximum parallelism)
-// - Work distribution via chunk-based partitioning
-// - No shared state between workers (thread-safe by design)
 func collectFuncScopesOptimized(
 	files []*goast.File,
 	info *types.Info,
@@ -31,36 +18,63 @@ func collectFuncScopesOptimized(
 	filesMap map[string]*goast.File,
 	seenPool *seenMapPool,
 ) []FuncScope {
-	funcNodes := identifyFuncNodes(files)
+	// Single fused pass over all AST files to build work units and indexes concurrently
+	funcNodes, mutatorIndex, stringMapIndex := scanFilesSinglePass(files, info)
 	if len(funcNodes) == 0 {
 		return nil
 	}
 
-	// Build the cross-function map-mutator index before spawning workers.
-	// This is cheap (one AST walk, no type lookups beyond what is already loaded).
-	mutatorIndex := buildMapMutatorIndex(files, info)
-
-	// Build the string-map index: package-level map[K]string variables whose
-	// values are string literals. Used to resolve template names that come
-	// from a map lookup (e.g. view, ok := labforms[request.ReportType]).
-	stringMapIndex := buildStringMapIndex(files, info)
-
 	return processNodesConcurrently(funcNodes, info, fset, structIndex, fc, config, filesMap, seenPool, mutatorIndex, stringMapIndex)
 }
 
-// identifyFuncNodes walks all AST files to identify nodes representing
-// distinct scopes: function declarations, function literals, and top-level
-// variable/constant declarations.
-func identifyFuncNodes(files []*goast.File) []funcWorkUnit {
-	// Estimate capacity: ~8 functions per file is typical
+// scanFilesSinglePass extracts function nodes, map mutators, and string maps in 1 pass.
+func scanFilesSinglePass(files []*goast.File, info *types.Info) ([]funcWorkUnit, map[string][]*goast.KeyValueExpr, map[string][]string) {
 	funcNodes := make([]funcWorkUnit, 0, len(files)*8)
+	mutatorIndex := make(map[string][]*goast.KeyValueExpr)
+	stringMapIndex := make(map[string][]string)
 
 	for _, f := range files {
 		for _, decl := range f.Decls {
 			switch node := decl.(type) {
 			case *goast.FuncDecl:
 				funcNodes = append(funcNodes, funcWorkUnit{node: node})
-				// Only inspect the body for closures, skipping the rest of the file
+
+				// Check for map mutator function signature (e.g., func SetTriageContext(ctx rex.Map, ...))
+				if node.Body != nil && node.Type.Params != nil && len(node.Type.Params.List) > 0 {
+					firstParam := node.Type.Params.List[0]
+					if isMapStringAnyParam(firstParam, info) {
+						paramNames := make(map[string]bool, len(firstParam.Names))
+						for _, n := range firstParam.Names {
+							paramNames[n.Name] = true
+						}
+
+						var kvs []*goast.KeyValueExpr
+						goast.Inspect(node.Body, func(n goast.Node) bool {
+							if assign, ok := n.(*goast.AssignStmt); ok {
+								for i, lhs := range assign.Lhs {
+									if idx, ok := lhs.(*goast.IndexExpr); ok {
+										if recv, ok := idx.X.(*goast.Ident); ok && paramNames[recv.Name] {
+											if keyLit, ok := idx.Index.(*goast.BasicLit); ok && keyLit.Kind == token.STRING {
+												if i < len(assign.Rhs) {
+													kvs = append(kvs, &goast.KeyValueExpr{
+														Key:   keyLit,
+														Value: assign.Rhs[i],
+													})
+												}
+											}
+										}
+									}
+								}
+							}
+							return true
+						})
+						if len(kvs) > 0 {
+							mutatorIndex[node.Name.Name] = kvs
+						}
+					}
+				}
+
+				// Inspect body for closures
 				if node.Body != nil {
 					goast.Inspect(node.Body, func(n goast.Node) bool {
 						if lit, ok := n.(*goast.FuncLit); ok {
@@ -69,15 +83,60 @@ func identifyFuncNodes(files []*goast.File) []funcWorkUnit {
 						return true
 					})
 				}
+
 			case *goast.GenDecl:
 				if node.Tok == token.VAR || node.Tok == token.CONST {
 					funcNodes = append(funcNodes, funcWorkUnit{node: node})
+				}
+
+				// String map index collection for package-level maps
+				if node.Tok == token.VAR {
+					for _, spec := range node.Specs {
+						vspec, ok := spec.(*goast.ValueSpec)
+						if !ok {
+							continue
+						}
+						for i, name := range vspec.Names {
+							if i >= len(vspec.Values) {
+								continue
+							}
+							comp, ok := vspec.Values[i].(*goast.CompositeLit)
+							if !ok {
+								continue
+							}
+
+							isValidMap := false
+							if info != nil {
+								if obj, ok := info.Defs[name]; ok && obj != nil {
+									isValidMap = isMapToStringType(obj.Type())
+								} else {
+									isValidMap = isMapToStringLitType(comp)
+								}
+							} else {
+								isValidMap = isMapToStringLitType(comp)
+							}
+
+							if isValidMap {
+								var vals []string
+								for _, elt := range comp.Elts {
+									if kv, ok := elt.(*goast.KeyValueExpr); ok {
+										if s := extractStringFast(kv.Value); s != "" {
+											vals = append(vals, s)
+										}
+									}
+								}
+								if len(vals) > 0 {
+									stringMapIndex[name.Name] = vals
+								}
+							}
+						}
+					}
 				}
 			}
 		}
 	}
 
-	return funcNodes
+	return funcNodes, mutatorIndex, stringMapIndex
 }
 
 // processNodesConcurrently distributes work units across multiple workers
@@ -148,157 +207,6 @@ func processChunk(
 		}
 	}
 	resultChan <- localScopes
-}
-
-// buildMapMutatorIndex scans all files for functions whose first parameter is
-// a map[string]any / map[string]interface{} (including named aliases like rex.Map)
-// and records every string-keyed index assignment made to that parameter.
-//
-// Example: func SetTriageContext(ctx rex.Map, ...) { ctx["visit"] = visit }
-// produces an entry: "SetTriageContext" → [KeyValueExpr{Key:"visit", Value:visit}, ...]
-//
-// The index is consumed by applyMapMutatorCall to propagate mutations from helper
-// functions back into the caller's tracked map variable.
-func buildMapMutatorIndex(files []*goast.File, info *types.Info) map[string][]*goast.KeyValueExpr {
-	index := make(map[string][]*goast.KeyValueExpr)
-
-	for _, f := range files {
-		for _, decl := range f.Decls {
-			fd, ok := decl.(*goast.FuncDecl)
-			if !ok || fd.Body == nil || fd.Type.Params == nil || len(fd.Type.Params.List) == 0 {
-				continue
-			}
-
-			firstParam := fd.Type.Params.List[0]
-			if !isMapStringAnyParam(firstParam, info) {
-				continue
-			}
-
-			// Collect the parameter names (usually one, but a, b rex.Map is valid Go).
-			paramNames := make(map[string]bool, len(firstParam.Names))
-			for _, n := range firstParam.Names {
-				paramNames[n.Name] = true
-			}
-
-			var kvs []*goast.KeyValueExpr
-			goast.Inspect(fd.Body, func(n goast.Node) bool {
-				assign, ok := n.(*goast.AssignStmt)
-				if !ok {
-					return true
-				}
-				for i, lhs := range assign.Lhs {
-					idx, ok := lhs.(*goast.IndexExpr)
-					if !ok {
-						continue
-					}
-					recv, ok := idx.X.(*goast.Ident)
-					if !ok || !paramNames[recv.Name] {
-						continue
-					}
-					keyLit, ok := idx.Index.(*goast.BasicLit)
-					if !ok || keyLit.Kind != token.STRING {
-						continue
-					}
-					if i < len(assign.Rhs) {
-						kvs = append(kvs, &goast.KeyValueExpr{
-							Key:   keyLit,
-							Value: assign.Rhs[i],
-						})
-					}
-				}
-				return true
-			})
-
-			if len(kvs) > 0 {
-				index[fd.Name.Name] = kvs
-			}
-		}
-	}
-	return index
-}
-
-// buildStringMapIndex scans all files for package-level variable declarations
-// of map types whose *value* type is string (e.g. map[SomeEnum]string,
-// map[string]string). It records every string-literal value found in the
-// composite literal, keyed by the variable name.
-//
-// This powers dynamic template-name resolution for the common pattern:
-//
-//	var labforms = map[enums.ReportType]string{
-//	    enums.ReportTypeGeneral: "views/lab/labforms/GENERAL.html",
-//	    enums.ReportTypeCbc:     "views/lab/labforms/CBC-3Part.html",
-//	    ...
-//	}
-//	view, ok := labforms[request.ReportType]
-//	c.Render(view, data)  // → generates a RenderCall per value in labforms
-//
-// The returned map is: varName → []string{all literal string values}.
-func buildStringMapIndex(files []*goast.File, info *types.Info) map[string][]string {
-	index := make(map[string][]string)
-
-	for _, f := range files {
-		for _, decl := range f.Decls {
-			genDecl, ok := decl.(*goast.GenDecl)
-			if !ok || genDecl.Tok != token.VAR {
-				continue
-			}
-
-			for _, spec := range genDecl.Specs {
-				vspec, ok := spec.(*goast.ValueSpec)
-				if !ok {
-					continue
-				}
-
-				for i, name := range vspec.Names {
-					if i >= len(vspec.Values) {
-						continue
-					}
-
-					comp, ok := vspec.Values[i].(*goast.CompositeLit)
-					if !ok {
-						continue
-					}
-
-					// Confirm the variable's type resolves to map[K]string.
-					// Prefer type-checker info; fall back to AST inspection.
-					if info != nil {
-						if obj, ok := info.Defs[name]; ok && obj != nil {
-							if !isMapToStringType(obj.Type()) {
-								continue
-							}
-						} else {
-							// Defs entry missing — fall through to AST check.
-							if !isMapToStringLitType(comp) {
-								continue
-							}
-						}
-					} else {
-						if !isMapToStringLitType(comp) {
-							continue
-						}
-					}
-
-					// Collect all string-literal values from the map literal.
-					var vals []string
-					for _, elt := range comp.Elts {
-						kv, ok := elt.(*goast.KeyValueExpr)
-						if !ok {
-							continue
-						}
-						if s := extractStringFast(kv.Value); s != "" {
-							vals = append(vals, s)
-						}
-					}
-
-					if len(vals) > 0 {
-						index[name.Name] = vals
-					}
-				}
-			}
-		}
-	}
-
-	return index
 }
 
 // isMapToStringType reports whether t is (or unwraps to) a map whose value

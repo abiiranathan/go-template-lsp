@@ -1,6 +1,6 @@
 module github.com/abiiranathan/go-template-lsp
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/abiiranathan/rex v1.8.0

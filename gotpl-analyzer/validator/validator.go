@@ -4,14 +4,6 @@ Package validator performs static analysis on Go templates to identify potential
 It analyzes template render calls, discovers template function maps, and validates
 template usages against their defined contexts. This package also includes
 functionality to extract and validate named template blocks (`define` and `block` actions).
-
-The validator provides:
-  - Detection of undefined template variables
-  - Validation of field access paths
-  - Detection of missing template files and named blocks
-  - Duplicate named block detection
-  - Scope-aware validation (handles with, range, if blocks)
-  - Support for nested templates and partials
 */
 package validator
 
@@ -27,28 +19,12 @@ import (
 	"github.com/abiiranathan/go-template-lsp/gotpl-analyzer/ast"
 )
 
+// TemplateStore caches template file contents in memory to prevent redundant disk reads.
+type TemplateStore map[string]string
+
 // ValidateTemplates validates all templates against their render calls AND
 // independently validates every template file and named block discovered by
 // walking the full template directory tree.
-//
-// Previously the validator only checked templates that appeared in Go render
-// calls.  That left two large blind spots:
-//
-//  1. Template files never directly targeted by Render() (layouts, partials,
-//     base files) were silently skipped.
-//  2. {{define}} / {{block}} blocks embedded anywhere in the tree are globally
-//     registered by Go's engine and reachable without any explicit render call.
-//
-// Validation process:
-//  1. Parse all named blocks from the template directory tree (concurrent).
-//  2. Detect duplicate block definitions.
-//  3. Build a lookup: template-name → merged variable context from render calls.
-//  4. Find all templates used as partials to avoid validating them with empty context.
-//  5. Validate each render call against its template (concurrent).
-//  6. Validate every file in the template tree NOT already covered by a render
-//     call and NOT used as a partial (concurrent).
-//  7. Validate every named block NOT already covered by a render call and NOT
-//     used as a partial (concurrent).
 func ValidateTemplates(
 	renderCalls []ast.RenderCall,
 	funcMaps []ast.FuncMapInfo,
@@ -56,22 +32,26 @@ func ValidateTemplates(
 	templateRoot string,
 ) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
 	funcMapRegistry := BuildFuncMapRegistry(funcMaps)
-	// Parse all named blocks from the entire template tree.
-	namedBlocks, namedBlockErrors := parseAllNamedTemplates(baseDir, templateRoot)
+
+	// Single disk walk: load all template contents into memory once
+	store := loadTemplateStore(baseDir, templateRoot)
+
+	// Parse named blocks using the in-memory template store
+	namedBlocks, namedBlockErrors := parseAllNamedTemplatesFromStore(store, baseDir, templateRoot)
 
 	// Build template-name → merged var list from all render calls.
 	renderVarsByTemplate := buildRenderVarIndex(renderCalls)
 
-	// Find all templates used as partials to avoid validating them with empty context.
-	partialTargets := FindPartialTargets(baseDir, templateRoot)
+	// Find partial targets using the in-memory template store
+	partialTargets := findPartialTargetsFromStore(store)
 
-	// Validate render-call targets (existing behaviour).
-	renderErrors := validateRenderCallsConcurrently(renderCalls, baseDir, templateRoot, namedBlocks, partialTargets, funcMapRegistry)
+	// Validate render-call targets using in-memory templates
+	renderErrors := validateRenderCallsConcurrently(store, renderCalls, baseDir, templateRoot, namedBlocks, partialTargets, funcMapRegistry)
 
-	// Validate all files in the tree not already covered.
-	treeErrors := validateTemplateTree(baseDir, templateRoot, namedBlocks, renderVarsByTemplate, partialTargets, funcMapRegistry)
+	// Validate all un-rendered files in the tree from memory
+	treeErrors := validateTemplateTreeFromStore(store, baseDir, templateRoot, namedBlocks, renderVarsByTemplate, partialTargets, funcMapRegistry)
 
-	// Validate named blocks not already covered by a render call.
+	// Validate orphaned named blocks
 	blockErrors := validateOrphanedNamedBlocks(namedBlocks, renderVarsByTemplate, baseDir, templateRoot, partialTargets, funcMapRegistry)
 
 	allErrors := append(renderErrors, treeErrors...)
@@ -91,33 +71,66 @@ func BuildFuncMapRegistry(funcMaps []ast.FuncMapInfo) FuncMapRegistry {
 var templateRegex = regexp.MustCompile(`\{\{-?\s*(?:template|block|define)\s+["'\x60]([^"'\x60]+)["'\x60]`)
 
 // FindPartialTargets scans all template files to find targets of {{template "..."}} or {{block "..."}} calls.
+// Exported for daemon and external callers.
 func FindPartialTargets(baseDir, templateRoot string) map[string]bool {
-	targets := make(map[string]bool)
+	store := loadTemplateStore(baseDir, templateRoot)
+	return findPartialTargetsFromStore(store)
+}
 
+func findPartialTargetsFromStore(store TemplateStore) map[string]bool {
+	targets := make(map[string]bool)
+	for _, content := range store {
+		matches := templateRegex.FindAllStringSubmatch(content, -1)
+		for _, m := range matches {
+			targets[m[1]] = true
+		}
+	}
+	return targets
+}
+
+// loadTemplateStore performs a single filepath.WalkDir and reads all template files into memory.
+func loadTemplateStore(baseDir, templateRoot string) TemplateStore {
+	store := make(TemplateStore)
 	root := filepath.Join(baseDir, templateRoot)
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+
+	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return nil
 		}
-		if !IsFileBasedPartial(path) {
-			return nil
-		}
-		content, err := os.ReadFile(path)
-		if err == nil {
-			matches := templateRegex.FindAllStringSubmatch(string(content), -1)
-			for _, m := range matches {
-				targets[m[1]] = true
+		if IsFileBasedPartial(path) {
+			if content, err := os.ReadFile(path); err == nil {
+				store[path] = string(content)
 			}
 		}
 		return nil
 	})
+	return store
+}
 
-	return targets
+func parseAllNamedTemplatesFromStore(store TemplateStore, baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
+	root := filepath.Join(baseDir, templateRoot)
+	registry := make(map[string][]NamedBlockEntry)
+
+	for path, content := range store {
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			rel = path
+		}
+		rel = filepath.ToSlash(rel)
+
+		local := make(map[string][]NamedBlockEntry)
+		extractNamedTemplatesFromContent(content, path, rel, local)
+
+		for name, entries := range local {
+			registry[name] = append(registry[name], entries...)
+		}
+	}
+
+	errors := detectDuplicateBlocks(registry)
+	return registry, errors
 }
 
 // buildRenderVarIndex creates a lookup: template-name → merged TemplateVar list.
-// When multiple render calls target the same template the variable sets are
-// unioned so validation gets the broadest possible context.
 func buildRenderVarIndex(renderCalls []ast.RenderCall) map[string][]ast.TemplateVar {
 	idx := make(map[string][]ast.TemplateVar, len(renderCalls))
 	seen := make(map[string]map[string]bool, len(renderCalls))
@@ -138,10 +151,10 @@ func buildRenderVarIndex(renderCalls []ast.RenderCall) map[string][]ast.Template
 	return idx
 }
 
-// validateTemplateTree walks every template file under baseDir/templateRoot and
-// validates files whose relative name was NOT already directly targeted by a
-// render call AND is NOT used as a partial. Already-validated files are skipped.
-func validateTemplateTree(
+// validateTemplateTreeFromStore iterates over in-memory template entries and validates
+// un-rendered/non-partial templates without disk I/O.
+func validateTemplateTreeFromStore(
+	store TemplateStore,
 	baseDir string,
 	templateRoot string,
 	namedBlocks map[string][]NamedBlockEntry,
@@ -154,41 +167,35 @@ func validateTemplateTree(
 	type workItem struct {
 		absPath string
 		relName string
+		content string
 		vars    []ast.TemplateVar
 	}
 
 	var items []workItem
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
-			return nil
-		}
-		if !IsFileBasedPartial(path) {
-			return nil
-		}
-
-		rel, err := filepath.Rel(root, path)
+	for absPath, content := range store {
+		rel, err := filepath.Rel(root, absPath)
 		if err != nil {
-			rel = path
+			rel = absPath
 		}
 		rel = filepath.ToSlash(rel)
 
-		// Skip files that are direct render-call targets — already validated.
+		// Skip files that are direct render-call targets — already validated
 		if isCoveredByRenderCall(rel, renderVarsByTemplate) {
-			return nil
+			continue
 		}
 
-		// Skip files that are used as partials — they will be validated via their callers.
+		// Skip files that are used as partials — validated via their callers
 		if partialTargets[rel] {
-			return nil
+			continue
 		}
 
 		items = append(items, workItem{
-			absPath: path,
+			absPath: absPath,
 			relName: rel,
-			vars:    renderVarsByTemplate[rel], // nil → empty context (valid)
+			content: content,
+			vars:    renderVarsByTemplate[rel],
 		})
-		return nil
-	})
+	}
 
 	if len(items) == 0 {
 		return nil
@@ -198,14 +205,11 @@ func validateTemplateTree(
 		var errs []ValidationResult
 		for _, i := range chunk {
 			item := items[i]
-			errs = append(errs, ValidateTemplateFile(
-				item.absPath,
-				item.vars,
-				item.relName,
-				baseDir,
-				templateRoot,
-				namedBlocks,
-				funcMaps,
+			varMap := buildVarMap(item.vars)
+			effectiveRegistry := mergeNamedBlockRegistry(namedBlocks, item.content, item.relName)
+			errs = append(errs, validateTemplateContentWithRegistry(
+				item.content, varMap, item.relName,
+				baseDir, templateRoot, 1, effectiveRegistry, funcMaps,
 			)...)
 		}
 		return errs
@@ -216,7 +220,6 @@ func isCoveredByRenderCall(rel string, renderVarsByTemplate map[string][]ast.Tem
 	if _, ok := renderVarsByTemplate[rel]; ok {
 		return true
 	}
-	// Normalize and try suffix/prefix matching
 	normalizedRel := filepath.ToSlash(filepath.Clean(rel))
 	normalizedRel = strings.TrimPrefix(normalizedRel, "./")
 	for key := range renderVarsByTemplate {
@@ -254,7 +257,6 @@ func validateOrphanedNamedBlocks(
 			continue
 		}
 
-		// Skip blocks that are used as partials — they will be validated via their callers.
 		if partialTargets[name] {
 			continue
 		}
@@ -291,8 +293,6 @@ func validateOrphanedNamedBlocks(
 	})
 }
 
-// runWorkers fans out index-based work to one goroutine per CPU core and
-// aggregates the results.  fn receives a slice of item indices to process.
 func runWorkers(total int, fn func([]int) []ValidationResult) []ValidationResult {
 	numWorkers := max(runtime.NumCPU(), 1)
 	chunkSize := (total + numWorkers - 1) / numWorkers
@@ -331,8 +331,8 @@ func runWorkers(total int, fn func([]int) []ValidationResult) []ValidationResult
 	return all
 }
 
-// validateRenderCallsConcurrently validates multiple render calls concurrently.
 func validateRenderCallsConcurrently(
+	store TemplateStore,
 	renderCalls []ast.RenderCall,
 	baseDir string,
 	templateRoot string,
@@ -344,14 +344,12 @@ func validateRenderCallsConcurrently(
 		return nil
 	}
 
-	// Build the union var index FIRST — same as what the daemon uses for live validation.
 	renderVarsByTemplate := buildRenderVarIndex(renderCalls)
 
-	// Deduplicate: only validate each unique template once, with unioned vars.
 	type workItem struct {
 		template string
 		vars     []ast.TemplateVar
-		rc       ast.RenderCall // for GoFile/GoLine metadata — use first call
+		rc       ast.RenderCall
 	}
 
 	seen := make(map[string]bool)
@@ -376,9 +374,21 @@ func validateRenderCallsConcurrently(
 		for _, i := range chunk {
 			item := items[i]
 			templatePath := filepath.Join(baseDir, templateRoot, item.template)
-			rcErrors := ValidateTemplateFile(
-				templatePath, item.vars, item.template, baseDir, templateRoot, namedBlocks, funcMaps,
-			)
+
+			var rcErrors []ValidationResult
+			if content, ok := store[templatePath]; ok {
+				varMap := buildVarMap(item.vars)
+				effectiveRegistry := mergeNamedBlockRegistry(namedBlocks, content, item.template)
+				rcErrors = validateTemplateContentWithRegistry(
+					content, varMap, item.template,
+					baseDir, templateRoot, 1, effectiveRegistry, funcMaps,
+				)
+			} else {
+				rcErrors = ValidateTemplateFile(
+					templatePath, item.vars, item.template, baseDir, templateRoot, namedBlocks, funcMaps,
+				)
+			}
+
 			for j := range rcErrors {
 				rcErrors[j].GoFile = item.rc.File
 				rcErrors[j].GoLine = item.rc.Line
@@ -393,14 +403,6 @@ func validateRenderCallsConcurrently(
 
 var validTemplateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
-// ValidateTemplateFile — accept the pre-built registry so the internal
-// ValidateTemplateContent call uses validateTemplateContentWithRegistry.
-// Public signature gains an optional variadic registry parameter so existing
-// callers (tests, external packages) need no changes.
-//
-// NOTE: The existing variadic `funcMaps ...FuncMapRegistry` parameter means we
-// cannot add a second variadic. Instead, thread the registry through the
-// existing non-variadic path and add an internal helper.
 func ValidateTemplateFile(
 	templatePath string,
 	vars []ast.TemplateVar,
@@ -413,7 +415,6 @@ func ValidateTemplateFile(
 
 	if entry, ok := findOverlayTemplateEntry(registry, templateName); ok {
 		varMap := buildVarMap(vars)
-		// Overlay content: merge once then use internal path.
 		effectiveRegistry := mergeNamedBlockRegistry(registry, entry.Content, entry.TemplatePath)
 		return validateTemplateContentWithRegistry(
 			entry.Content, varMap, entry.TemplatePath,
@@ -445,11 +446,14 @@ func ValidateTemplateFile(
 	}
 
 	varMap := buildVarMap(vars)
+	contentStr := string(content)
+
 	// Merge once here; all recursive calls through validateTemplateContentWithRegistry
 	// will use this registry without re-merging.
-	effectiveRegistry := mergeNamedBlockRegistry(registry, string(content), templateName)
+	effectiveRegistry := mergeNamedBlockRegistry(registry, contentStr, templateName)
+
 	return validateTemplateContentWithRegistry(
-		string(content), varMap, templateName,
+		contentStr, varMap, templateName,
 		baseDir, templateRoot, 1, effectiveRegistry, effectiveFuncMaps,
 	)
 }

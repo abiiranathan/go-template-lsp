@@ -18,11 +18,7 @@ extension/dist/
 .vscode-test/
 
 # Editor
-.vscode/
 !.vscode/extensions.json
-!.vscode/launch.json
-!.vscode/settings.json
-!.vscode/tasks.json
 .idea/
 *.swp
 .DS_Store

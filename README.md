@@ -12,7 +12,7 @@ If you've ever been frustrated by discovering template typos, missing variables,
 
 ## 🚀 Key Features
 
-*   **Framework Agnostic**: Works out-of-the-box with any Go web framework (Fiber, Echo, Gin, Chi, standard library `net/http`) using standard render patterns (e.g., `c.Render(name, data)` or `tmpl.ExecuteTemplate(wr, name, data)`).
+*   **Framework Agnostic**: Works out-of-the-box with any Go web framework (Fiber, Echo, Gin, Chi, standard library `net/http`) using standard render patterns (e.g., `c.Render(name, data)`, `c.HTML(code, name, data)`, `tmpl.ExecuteTemplate(wr, name, data)`).
 *   **Live Type-Safe Validation**: Detects missing variables, undefined struct fields, invalid map lookups, and type mismatches as you type.
 *   **Instant Sub-Millisecond Hover & IntelliSense**:
     *   Hover over any `{{ .Variable }}`, struct field, method, or function to view its exact Go type, parameter/return signatures, GoDoc comments, and nested field structures.
@@ -61,8 +61,10 @@ go install github.com/abiiranathan/go-template-lsp/gotpl-analyzer@latest
 Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type `GoTpl`:
 
 *   **GoTpl: Rebuild Template Index**: Forces a full re-analysis of Go source files to discover new handlers, templates, types, and FuncMaps.
-*   **GoTpl: Validate Current Template**: Manually triggers validation diagnostics on the active editor file.
+*   **GoTpl: Validate Template Variables**: Manually triggers validation diagnostics on the active editor file.
 *   **GoTpl: Show Template Knowledge Graph**: Opens an interactive visual panel detailing all templates, handler call-sites, and variable structures.
+*   **GoTpl: Go to Render Call**: Jumps directly to the Go handler that renders the active template.
+*   **GoTpl: Check for Analyzer Updates**: Checks the Go module proxy for newer releases of `gotpl-analyzer` and offers a one-click update.
 
 ---
 
@@ -75,7 +77,7 @@ Customize the extension behavior in your VS Code `settings.json`:
   // Enable or disable the extension features
   "gotpl.enabled": true,
 
-  // Custom path to the gotpl-analyzer binary.
+  // Custom path to the gotpl-analyzer binary (leave empty to use the auto-detected binary)
   "gotpl.goAnalyzerPath": "",
 
   // Go source directory relative to the workspace root
@@ -96,11 +98,39 @@ Customize the extension behavior in your VS Code `settings.json`:
   // Enable or disable live template validation diagnostics
   "gotpl.validate": true,
 
-  // Enable GZIP compression between the Go analyzer daemon and the editor (useful for massive codebases)
+  // Enable GZIP compression between the Go analyzer daemon and the editor
   "gotpl.compress": false,
 
   // Show validation errors at partial call sites in addition to the source definition site
-  "gotpl.showCallSiteErrors": false
+  "gotpl.showCallSiteErrors": false,
+
+  // ── Framework & Context Customization ─────────────────────────────────────
+
+  // List of function or method names that render templates across your codebase
+  "gotpl.renderFunctionNames": [
+    "Render",
+    "ExecuteTemplate",
+    "Execute",
+    "HTML",
+    "RenderTemplate",
+  ],
+
+  // List of method names used on web context to set template variables
+  "gotpl.setFunctionNames": [
+    "Set",
+    "Locals",
+    "SetVar",
+    "SetContext",
+  ],
+
+  // List of Go type names representing the web context receiver
+  "gotpl.contextTypeNames": [
+    "Context",
+    "Ctx",
+    "fiber.Ctx",
+    "gin.Context",
+    "echo.Context"
+  ]
 }
 ```
 
@@ -131,6 +161,12 @@ Usage of gotpl-analyzer:
         Validate template files against discovered Go render calls
   -context-file string
         Path to JSON file containing additional global context variables
+  -render-funcs string
+        Comma-separated list of render function names (e.g. Render,HTML,ExecuteTemplate)
+  -set-funcs string
+        Comma-separated list of context setter method names (e.g. Set,Locals)
+  -context-types string
+        Comma-separated list of context type names (e.g. Context,Ctx,fiber.Ctx,gin.Context)
   -compress
         Output gzip-compressed JSON responses
   -daemon
@@ -139,6 +175,8 @@ Usage of gotpl-analyzer:
         Output all discovered named templates and blocks as JSON
   -view-context string
         Print resolved variable context for a specific template path
+  -version
+        Print version and build info
 ```
 
 ---
@@ -201,13 +239,18 @@ Usage of gotpl-analyzer:
    ```
 2. Install extension dependencies:
    ```bash
-   npm install
+   cd extension && npm install
    ```
 3. Run test suites:
    ```bash
-   npm test
+   cd extension && npm test
    ```
-4. Launch Extension Development Host:
+4. Build the analyzer locally:
+   ```bash
+   cd gotpl-analyzer && make build
+   ```
+5. Launch Extension Development Host:
+   Open analyzer.ts and then
    * Press `F5` in VS Code to start a development window with the extension loaded.
 
 ---

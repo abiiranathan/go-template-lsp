@@ -8,11 +8,6 @@ import (
 
 // knownTypeMethods maps fully-qualified (or short) type names to the set of
 // methods that are callable on that type inside a Go template.
-//
-// Keys are matched against the bare type name after stripping pointer/slice
-// prefixes, so both "Time" and "time.Time" hit the same entry.
-//
-// Extend this map whenever a new domain type exposes template-callable methods.
 var knownTypeMethods = map[string]map[string]bool{
 	// ── Standard library ──────────────────────────────────────────────────
 	"time.Time": {
@@ -49,7 +44,6 @@ var knownTypeMethods = map[string]map[string]bool{
 		"Location":    true,
 		"MarshalText": true,
 	},
-	// Short alias so both "Time" and "time.Time" resolve correctly.
 	"Time": {
 		"Format":      true,
 		"String":      true,
@@ -93,8 +87,6 @@ var knownTypeMethods = map[string]map[string]bool{
 	"NullFloat64": {"Value": true, "Scan": true},
 
 	// ── Domain / custom types ─────────────────────────────────────────────
-	// "Date" is a common application-level type that wraps time.Time and
-	// typically implements fmt.Stringer plus a Format helper.
 	"Date": {
 		"String": true,
 		"Format": true,
@@ -102,32 +94,20 @@ var knownTypeMethods = map[string]map[string]bool{
 		"Before": true,
 		"After":  true,
 		"Equal":  true,
-		"Time":   true, // unwrap to time.Time
+		"Time":   true,
 	},
 }
 
-// universalMethods are callable on ANY type inside a Go template because every
-// Go value implicitly satisfies these interfaces or because the template engine
-// itself injects them.
 var universalMethods = map[string]bool{
-	// fmt.Stringer — implemented by a huge fraction of domain types.
 	"String": true,
-	// error interface.
-	"Error": true,
+	"Error":  true,
 }
 
-// typeHasMethod reports whether methodName is callable on typeName.
-//
-// Resolution order:
-//  1. Universal methods valid on every type (String, Error).
-//  2. Exact match in knownTypeMethods.
-//  3. Bare (unqualified) type name match, so "time.Time" also matches "Time".
 func typeHasMethod(typeName, methodName string) bool {
 	if universalMethods[methodName] {
 		return true
 	}
 
-	// Strip leading pointer/slice qualifiers for the lookup.
 	bare := typeName
 	for strings.HasPrefix(bare, "*") || strings.HasPrefix(bare, "[]") {
 		if strings.HasPrefix(bare, "*") {
@@ -141,13 +121,11 @@ func typeHasMethod(typeName, methodName string) bool {
 		return true
 	}
 
-	// Also try the unqualified name (last segment after ".").
 	if idx := strings.LastIndex(bare, "."); idx != -1 {
 		short := bare[idx+1:]
 		if methods, ok := knownTypeMethods[short]; ok && methods[short] {
 			return true
 		}
-		// Correctly use methodName (not short) for the lookup.
 		if methods, ok := knownTypeMethods[short]; ok && methods[methodName] {
 			return true
 		}
@@ -156,33 +134,7 @@ func typeHasMethod(typeName, methodName string) bool {
 	return false
 }
 
-// validateVariableInScope validates a variable access expression in the
-// current scope context.
-//
-// This function handles:
-//   - Root variable access: $.VarName
-//   - Current scope access: .VarName
-//   - Nested field access: .Var.Field.SubField
-//   - Map access: .MapVar.key
-//   - Method calls: .Var.Method (e.g. .CreatedAt.Format)
-//   - Unlimited nesting depth
-//
-// Validation logic:
-//  1. Parse expression into path segments
-//  2. Determine if root ($) or scoped (.) access
-//  3. Validate first segment exists in appropriate scope
-//  4. Validate remaining segments exist in field/method hierarchy
-//
-// Parameters:
-//   - varExpr: Variable expression to validate (e.g., ".User.Name")
-//   - scopeStack: Current scope stack
-//   - varMap: Root variable map
-//   - line, col: Source location for error reporting
-//   - templateName: Template name for error reporting
-//
-// Returns: ValidationResult pointer if error found, nil if valid
-//
-// Thread-safety: Read-only operations, safe for concurrent calls.
+// validateVariableInScope validates a variable access expression in the current scope context.
 func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar) *ValidationResult {
 	varExpr = strings.TrimSpace(varExpr)
 
@@ -190,6 +142,7 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		return nil
 	}
 
+	// ── Local variable access: $var or $var.Field ──────────────────────────
 	if strings.HasPrefix(varExpr, "$") && !strings.HasPrefix(varExpr, "$.") {
 		localVar, remainder, ok := lookupLocalVar(varExpr, scopeStack)
 		if !ok {
@@ -240,6 +193,27 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 			return nil
 		}
 
+		// Fallback for root-level scopes (e.g. inside `if` blocks at root level):
+		// Check varMap and rootScope directly if currentScope is the root.
+		if currentScope.IsRoot {
+			if v, ok := varMap[fieldName]; ok {
+				if len(parts) > 2 {
+					return validateNestedFields(varExpr, parts[2:], v.Fields, v.TypeStr, v.IsMap, v.ElemType)
+				}
+				return nil
+			}
+			if len(scopeStack) > 0 {
+				for _, f := range scopeStack[0].Fields {
+					if f.Name == fieldName {
+						if len(parts) > 2 {
+							return validateNestedFields(varExpr, parts[2:], f.Fields, f.TypeStr, f.IsMap, f.ElemType)
+						}
+						return nil
+					}
+				}
+			}
+		}
+
 		if len(currentScope.Fields) == 0 {
 			return nil
 		}
@@ -251,10 +225,12 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 	if len(parts) == 2 {
 		rootVar := parts[1]
 
-		rootScope := scopeStack[0]
-		for _, f := range rootScope.Fields {
-			if f.Name == rootVar {
-				return nil
+		if len(scopeStack) > 0 {
+			rootScope := scopeStack[0]
+			for _, f := range rootScope.Fields {
+				if f.Name == rootVar {
+					return nil
+				}
 			}
 		}
 
@@ -262,10 +238,11 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 			return nil
 		}
 
-		// Only report an error when we have concrete field metadata for the root scope.
-		// When scope fields are empty, stay permissive to avoid false positives
-		// on unhydrated partial contexts.
-		if len(rootScope.Fields) == 0 {
+		if len(scopeStack) > 0 && len(scopeStack[0].Fields) == 0 && len(varMap) == 0 {
+			return nil
+		}
+
+		if len(scopeStack) == 0 && len(varMap) == 0 {
 			return nil
 		}
 
@@ -278,7 +255,7 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 	var rootVarInfo *ast.TemplateVar
 	if v, ok := varMap[rootVar]; ok {
 		rootVarInfo = &v
-	} else {
+	} else if len(scopeStack) > 0 {
 		rootScope := scopeStack[0]
 		for _, f := range rootScope.Fields {
 			if f.Name == rootVar {
@@ -294,42 +271,16 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		return undefinedVariableError(varExpr)
 	}
 
-	// rootVarInfo is guaranteed non-nil beyond this point.
-	if rootVarInfo.IsMap && len(parts) == 3 {
-		return nil
+	if rootVarInfo != nil {
+		if rootVarInfo.IsMap && len(parts) == 3 {
+			return nil
+		}
+		return validateNestedFields(varExpr, parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, rootVarInfo.IsMap, rootVarInfo.ElemType)
 	}
 
-	return validateNestedFields(varExpr, parts[2:], rootVarInfo.Fields, rootVarInfo.TypeStr, rootVarInfo.IsMap, rootVarInfo.ElemType)
+	return undefinedVariableError(varExpr)
 }
 
-// validateNestedFields validates a field/method access path through a type
-// hierarchy. Supports unlimited nesting depth and handles maps, slices,
-// structs, and known methods.
-//
-// This function recursively traverses the field path, validating each segment
-// exists on the parent type either as a struct field or as a known method.
-//
-// Special handling:
-//   - Method calls: checked against knownTypeMethods and universalMethods
-//     before a "not found" error is emitted, so .CreatedAt.Format and
-//     .EDD.String resolve correctly without false positives.
-//   - Map types: Any key is valid, validates the value type for further nesting
-//   - Slice types: Element type is used for validation
-//   - Struct types: Field must exist in Fields slice
-//
-// Parameters:
-//   - fieldParts: Remaining field path segments to validate
-//   - fields: Available fields at current level
-//   - parentTypeName: Type name for error messages
-//   - isMap: Whether current type is a map
-//   - elemType: Element/value type for maps/slices
-//   - fullExpr: Complete original expression for error messages
-//   - line, col: Source location for error reporting
-//   - templateName: Template name for error reporting
-//
-// Returns: ValidationResult pointer if error found, nil if valid
-//
-// Thread-safety: Read-only operations, safe for concurrent calls.
 func validateNestedFields(fullExpr string, fieldParts []string, fields []ast.FieldInfo, parentTypeName string, isMap bool, elemType string) *ValidationResult {
 	currentFields := fields
 	parentType := parentTypeName

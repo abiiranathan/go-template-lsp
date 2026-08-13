@@ -168,6 +168,10 @@ export class GoAnalyzer {
     const contextFile = config.contextFile();
     const validate = config.validate();
 
+    const renderFunctionNames = config.renderFunctionNames();
+    const setFunctionNames = config.setFunctionNames();
+    const contextTypeNames = config.contextTypeNames();
+
     // Resolve the Go source directory to an absolute path
     const absSourceDir = path.resolve(workspaceRoot, sourceDir);
 
@@ -177,6 +181,9 @@ export class GoAnalyzer {
       templateBaseDir: templateBaseDir ? path.resolve(workspaceRoot, templateBaseDir) : '',
       contextFile: contextFile ? path.resolve(workspaceRoot, contextFile) : '',
       validate,
+      renderFunctionNames,
+      setFunctionNames,
+      contextTypeNames,
     };
   }
 
@@ -187,6 +194,9 @@ export class GoAnalyzer {
     const contextFile = config.contextFile();
     const enableGZIPCompression = config.compress();
     const validate = config.validate();
+    const renderFunctionNames = config.renderFunctionNames();
+    const setFunctionNames = config.setFunctionNames();
+    const contextTypeNames = config.contextTypeNames();
 
     this.outputChannel.appendLine(`SourceDir: ${sourceDir}`)
     this.outputChannel.appendLine(`templateRoot: ${templateRoot}`)
@@ -225,6 +235,16 @@ export class GoAnalyzer {
       } else {
         this.outputChannel.appendLine(`[Analyzer] Context file not found: ${absContextFile}`);
       }
+    }
+
+    if (renderFunctionNames.length > 0) {
+      args.push('-render-funcs', renderFunctionNames.join(','));
+    }
+    if (setFunctionNames.length > 0) {
+      args.push('-set-funcs', setFunctionNames.join(','));
+    }
+    if (contextTypeNames.length > 0) {
+      args.push('-context-types', contextTypeNames.join(','));
     }
 
     this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);

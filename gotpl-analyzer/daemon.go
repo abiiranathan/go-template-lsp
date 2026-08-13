@@ -56,14 +56,27 @@ type rpcError struct {
 type daemonAnalyzeParams struct {
 	// Dir is the absolute path to the Go module root directory.
 	Dir string `json:"dir"`
+
 	// TemplateRoot is the relative path from the base directory to the template folder.
 	TemplateRoot string `json:"templateRoot"`
+
 	// TemplateBaseDir overrides Dir as the base for resolving TemplateRoot. If empty, Dir is used.
 	TemplateBaseDir string `json:"templateBaseDir"`
+
 	// ContextFile is the optional path to a rex-analyzer.json file providing additional context.
 	ContextFile string `json:"contextFile"`
+
 	// Validate enables template validation against Go types when true.
 	Validate bool `json:"validate"`
+
+	// RenderFunctionNames is a slice of function or method names that render templates
+	RenderFunctionNames []string `json:"renderFunctionNames,omitempty"`
+
+	// List of method names used to set context variables (e.g. c.Set, c.Locals).
+	SetFunctionNames []string `json:"setFunctionNames,omitempty"`
+
+	// List of Go type names representing the web context receiver.
+	ContextTypeNames []string `json:"contextTypeNames,omitempty"`
 }
 
 // daemonValidateTemplateParams holds the parameters for the "validateTemplate" RPC method.
@@ -80,6 +93,7 @@ type daemonValidateTemplateParams struct {
 type daemonUpdateTemplateParams struct {
 	// AbsolutePath is the absolute on-disk path of the template file to overlay.
 	AbsolutePath string `json:"absolutePath"`
+
 	// Content is the unsaved editor buffer content to store as an overlay.
 	Content string `json:"content"`
 }
@@ -97,10 +111,13 @@ type daemonClearTemplateParams struct {
 type daemonInferExpressionParams struct {
 	// Expression is the template expression to resolve (e.g. ".Name", ".Items | len").
 	Expression string `json:"expression"`
+
 	// Vars is the set of template variables available at the expression's scope.
 	Vars map[string]ast.TemplateVar `json:"vars"`
+
 	// ScopeStack is the nesting of block scopes (range, with, if) surrounding the expression.
 	ScopeStack []validator.ScopeType `json:"scopeStack"`
+
 	// BlockLocals contains variables declared by {{$x := ...}} within the current block.
 	BlockLocals map[string]ast.TemplateVar `json:"blockLocals"`
 }
@@ -111,10 +128,13 @@ type daemonInferExpressionParams struct {
 type daemonGetHoverInfoParams struct {
 	// AbsolutePath is the absolute on-disk path of the template file.
 	AbsolutePath string `json:"absolutePath"`
+
 	// Line is the 1-based line number of the cursor position.
 	Line int `json:"line"`
+
 	// Col is the 1-based column number of the cursor position.
 	Col int `json:"col"`
+
 	// Content is the current editor buffer content for the template.
 	Content string `json:"content"`
 }
@@ -125,6 +145,7 @@ type daemonGetHoverInfoParams struct {
 type daemonValidateTemplateResult struct {
 	// ValidationErrors is the list of validation issues found in the template.
 	ValidationErrors []validator.ValidationResult `json:"validationErrors"`
+
 	// HasContext is true when render-call variable context was found for the template.
 	HasContext bool `json:"hasContext"`
 }
@@ -133,35 +154,37 @@ type daemonValidateTemplateResult struct {
 // concurrent read-only operations (validateTemplate, inferExpressionType,
 // getHoverInfo).  The pointer is replaced atomically on each analyze call so
 // readers always see a consistent snapshot without acquiring a write lock.
-//
-// OPTIMISATION: Previously every read-only handler performed deep clones of
-// renderVarsByTemplate, funcMaps, typeRegistry, namedBlocks, and
-// templateOverlays under a write-locked mutex — O(n) allocations per request.
-// With an atomic pointer swap, read-only handlers simply load the pointer and
-// read the shared snapshot.  Only the mutable templateOverlays map (written
-// per file save) is still protected by a lightweight RWMutex.
 type daemonState struct {
 	// dir is the Go module root directory used for analysis.
 	dir string
+
 	// baseDir is the resolved base directory for template lookup (may differ from dir).
 	baseDir string
+
 	// templateRoot is the relative path from baseDir to the template folder.
 	templateRoot string
+
 	// contextFile is the path to the optional rex-analyzer.json context file.
 	contextFile string
+
 	// validate indicates whether template validation was enabled for this snapshot.
 	validate bool
+
 	// output is the complete validation output returned by the last analyze call.
 	output ValidationOutput
 
 	// renderVarsByTemplate maps template names to their merged set of render-call variables.
 	renderVarsByTemplate map[string][]ast.TemplateVar
+
 	// funcMaps is the registry of all template function maps discovered in the Go source.
 	funcMaps validator.FuncMapRegistry
+
 	// typeRegistry maps fully-qualified Go type names to their field information.
 	typeRegistry map[string][]ast.FieldInfo
+
 	// namedBlocks maps block names to their definition entries across all template files.
 	namedBlocks map[string][]validator.NamedBlockEntry
+
 	// partialTargets is a set of template names that are invoked as partials (via {{template}}).
 	partialTargets map[string]bool
 
@@ -191,6 +214,7 @@ type analyzerDaemon struct {
 	// RWMutex instead of the coarse daemon-wide lock.
 	// overlayMu protects templateOverlays for concurrent read/write access.
 	overlayMu sync.RWMutex
+
 	// templateOverlays maps absolute template file paths to their unsaved editor buffer content.
 	templateOverlays map[string]string
 }
@@ -374,6 +398,20 @@ func (d *analyzerDaemon) handle(req rpcRequest) rpcResponse {
 	}
 }
 
+func (p daemonAnalyzeParams) toAnalysisConfig() *ast.AnalysisConfig {
+	cfg := ast.DefaultConfig
+	if len(p.RenderFunctionNames) > 0 {
+		cfg.RenderFunctionNames = p.RenderFunctionNames
+	}
+	if len(p.SetFunctionNames) > 0 {
+		cfg.SetFunctionNames = p.SetFunctionNames
+	}
+	if len(p.ContextTypeNames) > 0 {
+		cfg.ContextTypeNames = p.ContextTypeNames
+	}
+	return &cfg
+}
+
 // analyze performs a full or incremental project analysis. It uses fingerprinting
 // to detect changes: if nothing changed, the cached output is returned immediately;
 // if only templates changed, Go analysis is reused; otherwise a full packages.Load
@@ -404,7 +442,9 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 	}
 
 	// Cold path: full analysis required.
-	result := ast.AnalyzeDir(params.Dir, params.ContextFile, ast.DefaultConfig)
+	// Pass user configuration to AnalyzeDir
+	result := ast.AnalyzeDir(params.Dir, params.ContextFile, params.toAnalysisConfig())
+
 	result.Errors = filterImportErrors(result.Errors)
 
 	return d.buildSnapshotFromResult(&result, params, baseDir, goFP, tmplFP)

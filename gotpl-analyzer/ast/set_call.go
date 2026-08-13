@@ -4,31 +4,41 @@ import (
 	goast "go/ast"
 	"go/token"
 	"go/types"
+	"slices"
+	"strings"
 )
 
 // extractSetCallVarOptimized extracts template variable information from
-// a context.Set() call. Validates the receiver type and extracts comprehensive
-// type information including nested fields and documentation.
+// a context setter call across any framework.
 //
-// Example: ctx.Set("user", user)
-// Extracts: name="user", type, fields, documentation
+// Examples:
+//   - c.Set("user", user)        (Echo, Gin, Rex)
+//   - c.Locals("user", user)     (Fiber)
+//   - ctx.SetVar("user", user)   (Custom)
+//
+// Extracts: name="user", type, fields, documentation.
 func extractSetCallVarOptimized(
 	call *goast.CallExpr,
 	info *types.Info,
 	fset *token.FileSet,
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	config AnalysisConfig,
+	config *AnalysisConfig,
 	seenPool *seenMapPool,
 ) *TemplateVar {
 	// Must be method call
 	sel, ok := call.Fun.(*goast.SelectorExpr)
-	if !ok || sel.Sel.Name != config.SetFunctionName {
+	if !ok {
 		return nil
 	}
 
-	// Verify receiver type matches configured context type
-	if !isContextType(sel.X, info, config.ContextTypeName) {
+	// Verify method name matches any configured setter
+	if !isSetterMethod(sel.Sel.Name, config) {
+		return nil
+	}
+
+	// Verify receiver is a context object
+	if !isContextReceiver(sel.X, info, config) {
 		return nil
 	}
 
@@ -38,6 +48,17 @@ func extractSetCallVarOptimized(
 	}
 
 	key := extractStringFast(call.Args[0])
+	if key == "" {
+		if ident, ok := call.Args[0].(*goast.Ident); ok && info != nil {
+			if obj := info.ObjectOf(ident); obj != nil {
+				if c, ok := obj.(*types.Const); ok {
+					key = c.Val().String()
+					key = strings.Trim(key, `"`)
+				}
+			}
+		}
+	}
+
 	if key == "" {
 		return nil
 	}
@@ -69,14 +90,34 @@ func extractSetCallVarOptimized(
 	return &tv
 }
 
-// isContextType verifies that an expression has the configured context type.
-func isContextType(expr goast.Expr, info *types.Info, contextTypeName string) bool {
-	if info == nil || expr == nil {
+// isSetterMethod reports whether methodName is in the configured SetFunctionNames slice.
+func isSetterMethod(methodName string, config *AnalysisConfig) bool {
+	if len(config.SetFunctionNames) > 0 && slices.Contains(config.SetFunctionNames, methodName) {
+		return true
+	}
+	return methodName == config.SetFunctionName
+}
+
+// isContextReceiver flexibly matches context receivers across frameworks by type name or identifier convention.
+func isContextReceiver(expr goast.Expr, info *types.Info, config *AnalysisConfig) bool {
+	if expr == nil {
+		return false
+	}
+
+	// Heuristic 1: Match common receiver identifier names
+	if ident, ok := expr.(*goast.Ident); ok {
+		name := strings.ToLower(ident.Name)
+		if name == "c" || name == "ctx" || name == "context" || name == "req" || name == "r" {
+			return true
+		}
+	}
+
+	if info == nil {
 		return false
 	}
 
 	typeAndValue, ok := info.Types[expr]
-	if !ok {
+	if !ok || typeAndValue.Type == nil {
 		return false
 	}
 
@@ -87,9 +128,18 @@ func isContextType(expr goast.Expr, info *types.Info, contextTypeName string) bo
 		t = ptr.Elem()
 	}
 
-	// Check named type
-	named, ok := t.(*types.Named)
-	return ok && named.Obj().Name() == contextTypeName
+	typeStr := t.String()
+	for _, ctxName := range config.ContextTypeNames {
+		if strings.HasSuffix(typeStr, ctxName) {
+			return true
+		}
+	}
+
+	if config.ContextTypeName != "" && strings.HasSuffix(typeStr, config.ContextTypeName) {
+		return true
+	}
+
+	return false
 }
 
 // checkSliceType determines if a type is a slice and extracts element type info.

@@ -113,6 +113,15 @@ export async function activate(context: vscode.ExtensionContext) {
           'No template index yet. Run "GoTpl: Rebuild Template Index" first.'
         );
       }
+    }),
+
+    vscode.commands.registerCommand('gotpl.checkUpdates', async () => {
+      const analyzerPath = await AnalyzerInstaller.getAnalyzerPath();
+      if (!analyzerPath) {
+        vscode.window.showWarningMessage('gotpl-analyzer is not installed.');
+        return;
+      }
+      await AnalyzerInstaller.checkForUpdates(analyzerPath, outputChannel);
     })
   );
 

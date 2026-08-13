@@ -11,7 +11,7 @@ func TestAutoContextDiscovery(t *testing.T) {
 	reproDir, _ := filepath.Abs("testdata/repro")
 
 	// Run analysis
-	result := AnalyzeDir(reproDir, "", DefaultConfig)
+	result := AnalyzeDir(reproDir, "", &DefaultConfig)
 
 	if len(result.Errors) > 0 {
 		t.Fatalf("Analysis failed with errors: %v", result.Errors)
@@ -88,7 +88,7 @@ go 1.20
 	}
 
 	// Run analysis on the temp dir
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 
 	// We expect 2 render calls (viewA and viewB)
 	if len(result.RenderCalls) != 2 {

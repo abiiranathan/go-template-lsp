@@ -37,7 +37,7 @@ func main() {
 		t.Fatalf("failed to write go.mod: %v", err)
 	}
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 
 	expected := map[string]bool{
 		"index.html": false,
@@ -101,7 +101,7 @@ func main() {
 		t.Fatalf("failed to write go.mod: %v", err)
 	}
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 
 	expected := map[string]bool{
 		"toUpper":     false,

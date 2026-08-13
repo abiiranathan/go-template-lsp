@@ -15,8 +15,10 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
 	"github.com/abiiranathan/go-template-lsp/gotpl-analyzer/ast"
@@ -54,9 +56,22 @@ type ValidationOutput struct {
 	Types map[string][]ast.FieldInfo `json:"types,omitempty"`
 }
 
+// Version is the fallback version if built from source without module metadata
+var Version = "v0.5.0"
+
+func getVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			return info.Main.Version
+		}
+	}
+	return Version
+}
+
 // main is the CLI entry point for the template analyzer.
 func main() {
 	// Command-line flags
+	versionFlag := flag.Bool("version", false, "Print version and exit")
 	dir := flag.String("dir", ".", "Go source directory to analyze")
 	templateRoot := flag.String("template-root", "", "Root directory for templates")
 	templateBaseDir := flag.String("template-base-dir", "", "Base directory for template-root")
@@ -66,7 +81,19 @@ func main() {
 	daemon := flag.Bool("daemon", false, "Run as a long-lived JSON-RPC daemon over stdio")
 	showNamedTemplates := flag.Bool("named-templates", false, "Return all named template as JSON")
 	viewContext := flag.String("view-context", "", "Show context for a specific template")
+
+	// Custom framework configuration flags
+	renderFuncsFlag := flag.String("render-funcs", "", "Comma-separated list of render function names (e.g. Render,HTML,ExecuteTemplate)")
+	setFuncsFlag := flag.String("set-funcs", "", "Comma-separated list of context setter names (e.g. Set,Locals)")
+	contextTypesFlag := flag.String("context-types", "", "Comma-separated list of context types (e.g. Context,fiber.Ctx,gin.Context)")
 	flag.Parse()
+
+	// Print ONLY the version and exit.
+	// Parsed by extension to trigger updates.
+	if *versionFlag {
+		fmt.Println(getVersion())
+		return
+	}
 
 	if *daemon {
 		if err := runDaemon(os.Stdin, os.Stdout); err != nil {
@@ -83,8 +110,20 @@ func main() {
 		templateBase = mustAbs(*templateBaseDir)
 	}
 
+	// Build custom AnalysisConfig from CLI flags (falling back to DefaultConfig)
+	analysisConfig := ast.DefaultConfig
+	if *renderFuncsFlag != "" {
+		analysisConfig.RenderFunctionNames = splitAndTrim(*renderFuncsFlag, ",")
+	}
+	if *setFuncsFlag != "" {
+		analysisConfig.SetFunctionNames = splitAndTrim(*setFuncsFlag, ",")
+	}
+	if *contextTypesFlag != "" {
+		analysisConfig.ContextTypeNames = splitAndTrim(*contextTypesFlag, ",")
+	}
+
 	// Run static analysis on the source directory.
-	result := ast.AnalyzeDir(absDir, *contextFile, ast.DefaultConfig)
+	result := ast.AnalyzeDir(absDir, *contextFile, &analysisConfig)
 
 	// view-context outputs the full variable context (including inline field
 	// trees) for a single template so the editor extension can render hover
@@ -141,6 +180,17 @@ func main() {
 
 	// Encode and write JSON output
 	encodeJSON(output, *compress)
+}
+
+func splitAndTrim(s, sep string) []string {
+	parts := strings.Split(s, sep)
+	res := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			res = append(res, trimmed)
+		}
+	}
+	return res
 }
 
 // encodeJSON serializes output as JSON and writes it to stdout.

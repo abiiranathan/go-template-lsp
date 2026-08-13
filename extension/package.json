@@ -56,6 +56,12 @@
         "command": "gotpl.goToRenderCall",
         "title": "GoTpl: Go to Render Call",
         "category": "GoTpl"
+      },
+      {
+        "command": "gotpl.checkUpdates",
+        "title": "GoTpl: Check for Analyzer Updates",
+        "icon": "$(cloud-download)",
+        "category": "GoTpl"
       }
     ],
     "menus": {
@@ -126,6 +132,45 @@
           "type": "boolean",
           "default": false,
           "description": "Show validation errors at partial/named-block call sites in addition to the actual source location. When false, errors only appear where the bug is, with call sites shown as related information."
+        },
+        "gotpl.renderFunctionNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "Render",
+            "ExecuteTemplate",
+            "RenderTemplate"
+          ],
+          "description": "List of function or method names that render templates."
+        },
+        "gotpl.setFunctionNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "Set",
+            "Locals",
+            "SetVar",
+            "SetContext"
+          ],
+          "description": "List of method names used to set context variables (e.g. c.Set, c.Locals)."
+        },
+        "gotpl.contextTypeNames": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "Context",
+            "fiber.Ctx",
+            "c.HTML",
+            "gin.Context",
+            "echo.Context"
+          ],
+          "description": "List of Go type names representing the web context receiver."
         }
       }
     }

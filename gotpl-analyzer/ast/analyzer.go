@@ -24,7 +24,7 @@ import (
 // analysis + optional context-enrichment reload).  It now loads exactly once and
 // passes the pkgs slice to every downstream step, eliminating the redundant
 // packages.Load that previously happened inside the context-enrichment branch.
-func AnalyzeDir(dir string, contextFile string, config AnalysisConfig) AnalysisResult {
+func AnalyzeDir(dir string, contextFile string, config *AnalysisConfig) AnalysisResult {
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
 	cfg := &packages.Config{

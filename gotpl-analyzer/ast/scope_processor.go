@@ -8,14 +8,14 @@ import (
 	"strings"
 )
 
-// MaxAssignmentsPerVar is the maximum number of string assignments to track per variable
+// MaxAssignmentsPerVar is the maximum number of string assignments to track per variable.
 const MaxAssignmentsPerVar = 10
 
 // processFunc analyzes a single function or declaration to extract:
 //  1. String literal assignments (for template name resolution)
 //  2. FuncMap assignments (template function definitions)
 //  3. Template render calls
-//  4. Context variable Set calls
+//  4. Context variable Set/Locals calls
 //
 // OPTIMISATION: Merged into a single AST walk instead of two separate passes.
 func processFunc(
@@ -24,14 +24,15 @@ func processFunc(
 	fset *token.FileSet,
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	config AnalysisConfig,
+	config *AnalysisConfig,
 	filesMap map[string]*goast.File,
 	seenPool *seenMapPool,
 	mutatorIndex map[string][]*goast.KeyValueExpr,
 	stringMapIndex map[string][]string,
 ) FuncScope {
 	scope := FuncScope{
-		MapAssignments: make(map[string]*goast.CompositeLit, 4),
+		MapAssignments:    make(map[string]*goast.CompositeLit, 4),
+		StructAssignments: make(map[string]*goast.CompositeLit, 4),
 	}
 	stringAssignments := make(map[string][]string, 8)
 	funcMapAssignments := make(map[string]*goast.CompositeLit, 4)
@@ -76,7 +77,6 @@ func processFunc(
 	return scope
 }
 
-// processAssignStmt handles assignment statements.
 // processAssignStmt handles assignment statements.
 func processAssignStmt(
 	assign *goast.AssignStmt,
@@ -150,6 +150,8 @@ func processAssignStmt(
 				scope.FuncMaps = append(scope.FuncMaps, extractFuncMaps(comp, info, fset, filesMap, structIndex, fc, seenPool)...)
 			} else if isDataMapType(ident, info) {
 				scope.MapAssignments[ident.Name] = comp
+			} else {
+				scope.StructAssignments[ident.Name] = comp
 			}
 		}
 	}
@@ -203,7 +205,7 @@ func trackMapIndexAssign(indexExpr *goast.IndexExpr, rhs goast.Expr, scope *Func
 }
 
 // isDataMapType returns true when ident has a map type whose key is string and
-// whose value is interface{} / any.
+// whose value is interface{} / any (e.g. map[string]any, gin.H, fiber.Map, rex.Map).
 func isDataMapType(ident *goast.Ident, info *types.Info) bool {
 	if info == nil {
 		return false
@@ -224,10 +226,12 @@ func isDataMapType(ident *goast.Ident, info *types.Info) bool {
 		return false
 	}
 
+	// Key must be string
 	if basic, ok := m.Key().(*types.Basic); !ok || basic.Kind() != types.String {
 		return false
 	}
 
+	// Value must be interface{} / any (e.g. gin.H, fiber.Map, map[string]any)
 	_, isIface := m.Elem().Underlying().(*types.Interface)
 	return isIface
 }
@@ -281,6 +285,8 @@ func processGenDecl(
 				if info != nil {
 					if isDataMapType(name, info) {
 						scope.MapAssignments[name.Name] = comp
+					} else {
+						scope.StructAssignments[name.Name] = comp
 					}
 				}
 			}
@@ -295,7 +301,7 @@ func processCallExpr(
 	fset *token.FileSet,
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
-	config AnalysisConfig,
+	config *AnalysisConfig,
 	seenPool *seenMapPool,
 	scope *FuncScope,
 	stringAssignments map[string][]string,

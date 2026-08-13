@@ -33,3 +33,4 @@ analyzer/rex-analyzer.exe
 prompt*.txt
 *.test
 *.prof
+dist

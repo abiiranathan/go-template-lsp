@@ -69,6 +69,25 @@ class Config {
     showCallSiteErrors(): boolean {
         return this.get<boolean>('showCallSiteErrors') ?? false;
     }
+
+    /**
+     * Function names considered RenderCalls.
+     */
+    renderFunctionNames(): string[] {
+        return this.get<string[]>('renderFunctionNames') ?? [
+            'Render', 'ExecuteTemplate', 'RenderTemplate'
+        ];
+    }
+
+    setFunctionNames(): string[] {
+        return this.get<string[]>('setFunctionNames') ?? ['Set', 'Locals', 'SetVar', 'SetContext'];
+    }
+
+    contextTypeNames(): string[] {
+        return this.get<string[]>('contextTypeNames') ?? [
+            'Context', 'fiber.Ctx', 'gin.Context', 'c.HTML', 'echo.Context',
+        ];
+    }
 }
 
 export const config = new Config();

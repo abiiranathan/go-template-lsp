@@ -5,91 +5,102 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"slices"
+	"strings"
 )
 
 // resolveRenderCall analyzes a render call expression to extract:
 // - Template name(s) being rendered
 // - Index of the template name argument
+// - Index of the data payload argument
 //
 // Template names can come from:
-// 1. String literals: c.Render("template.html", data)
+// 1. String literals: c.Render("template.html", data), c.HTML(200, "template.html", data)
 // 2. Constants: c.Render(TemplateName, data)
 // 3. Variables: c.Render(tplName, data)
-func resolveRenderCall(
+func resolveRenderCall(call *goast.CallExpr, info *types.Info, stringAssignments map[string][]string) *ResolvedRender {
+	if len(call.Args) == 0 {
+		return nil
+	}
+
+	// Dynamically determine the index of the template argument and data argument
+	tplIdx, dataIdx := detectTemplateAndDataArgIndices(call, info, stringAssignments)
+	if tplIdx < 0 || tplIdx >= len(call.Args) {
+		return nil
+	}
+
+	arg := call.Args[tplIdx]
+
+	// Resolve template name(s)
+	names := resolveTemplateName(arg, info, stringAssignments)
+	if len(names) == 0 {
+		return nil
+	}
+
+	return &ResolvedRender{
+		Node:           call,
+		TemplateNames:  names,
+		TemplateArgIdx: tplIdx,
+		DataArgIdx:     dataIdx,
+	}
+}
+
+// detectTemplateAndDataArgIndices inspects arguments across various Go web framework
+// signatures (Gin, Echo, Fiber, standard library, Chi) to find:
+//   - tplIdx:  index of the template path argument
+//   - dataIdx: index of the data context payload argument
+func detectTemplateAndDataArgIndices(
 	call *goast.CallExpr,
 	info *types.Info,
 	stringAssignments map[string][]string,
-) *ResolvedRender {
-	resolved := &ResolvedRender{
-		Node:           call,
-		TemplateArgIdx: -1,
-	}
-
-	// Determine expected position of template argument
-	templateArgIdx := inferTemplateArgIdx(call)
-
-	// Find actual template argument position
-	templateArgIdx = findTemplateArg(call, templateArgIdx, stringAssignments)
-
-	if templateArgIdx < 0 || templateArgIdx >= len(call.Args) {
-		return nil
-	}
-
-	resolved.TemplateArgIdx = templateArgIdx
-	arg := call.Args[templateArgIdx]
-
-	// Resolve template name(s)
-	resolved.TemplateNames = resolveTemplateName(arg, info, stringAssignments)
-
-	if len(resolved.TemplateNames) == 0 {
-		return nil
-	}
-
-	return resolved
-}
-
-// inferTemplateArgIdx determines the likely index of the template argument
-// based on the function call syntax.
-func inferTemplateArgIdx(call *goast.CallExpr) int {
-	switch call.Fun.(type) {
-	case *goast.SelectorExpr:
-		// Method call: obj.Render(template, ...)
-		return 0
-	case *goast.Ident:
-		// Function call: Render(obj, template, ...)
-		return -1
-	default:
-		return -1
-	}
-}
-
-// findTemplateArg locates the template name argument in the call.
-// If initial index is -1, searches for first string-like argument.
-func findTemplateArg(
-	call *goast.CallExpr,
-	initialIdx int,
-	stringAssignments map[string][]string,
-) int {
-	if initialIdx >= 0 {
-		return initialIdx
-	}
-
-	// Search for first string argument or known string variable
+) (tplIdx int, dataIdx int) {
+	// Pass 1: Look for explicit template file extensions (e.g. "index.html", "user.tmpl")
 	for i, arg := range call.Args {
-		// String literal
-		if lit, ok := arg.(*goast.BasicLit); ok && lit.Kind == token.STRING {
-			return i
-		}
-
-		// Variable with known string value
-		if ident, ok := arg.(*goast.Ident); ok {
-			if _, ok := stringAssignments[ident.Name]; ok {
-				return i
+		if s := extractStringFast(arg); s != "" {
+			if isTemplateExtension(s) {
+				return i, i + 1
 			}
 		}
 	}
 
-	return -1
+	// Pass 2: Look for tracked string variables
+	for i, arg := range call.Args {
+		if ident, ok := arg.(*goast.Ident); ok {
+			if vals, ok := stringAssignments[ident.Name]; ok && len(vals) > 0 {
+				return i, i + 1
+			}
+		}
+	}
+
+	// Pass 3: Check framework signature patterns based on string-typed arguments
+	for i, arg := range call.Args {
+		// Basic string literal
+		if lit, ok := arg.(*goast.BasicLit); ok && lit.Kind == token.STRING {
+			return i, i + 1
+		}
+
+		// Resolved Go type is string
+		if info != nil {
+			if tv, ok := info.Types[arg]; ok && tv.Type != nil {
+				if basic, ok := tv.Type.Underlying().(*types.Basic); ok && basic.Kind() == types.String {
+					return i, i + 1
+				}
+			}
+		}
+	}
+
+	return -1, -1
+}
+
+// isTemplateExtension reports whether a filename has a common Go template extension.
+func isTemplateExtension(name string) bool {
+	lower := strings.ToLower(name)
+	for _, ext := range []string{".html", ".tmpl", ".gohtml", ".tpl", ".htm"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveTemplateName extracts template name(s) from an argument expression.
@@ -130,9 +141,9 @@ func resolveTemplateName(
 	return nil
 }
 
-// isRenderCall checks if a call expression is a template render call
+// isRenderCall checks if a call expression matches known template render functions
 // based on configured function names.
-func isRenderCall(call *goast.CallExpr, config AnalysisConfig) bool {
+func isRenderCall(call *goast.CallExpr, config *AnalysisConfig) bool {
 	funcName := ""
 
 	switch fn := call.Fun.(type) {
@@ -142,6 +153,15 @@ func isRenderCall(call *goast.CallExpr, config AnalysisConfig) bool {
 		funcName = fn.Name
 	}
 
-	return (funcName == config.RenderFunctionName || funcName == config.ExecuteTemplateFunctionName) &&
-		len(call.Args) >= 2
+	if funcName == "" {
+		return false
+	}
+
+	// Check configured names list
+	if len(config.RenderFunctionNames) > 0 && slices.Contains(config.RenderFunctionNames, funcName) {
+		return true
+	}
+
+	// Backward compatibility fallback
+	return funcName == config.RenderFunctionName || funcName == config.ExecuteTemplateFunctionName
 }

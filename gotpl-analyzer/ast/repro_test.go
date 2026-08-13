@@ -42,7 +42,7 @@ func main() {
 `
 	writeTestModule(t, tmpDir, mainContent)
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall, got 0")
@@ -189,7 +189,7 @@ func main() {
 `
 	writeTestModule(t, tmpDir, mainContent)
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
 	}
@@ -276,7 +276,7 @@ func main() {
 `
 	writeTestModule(t, tmpDir, mainContent)
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
 	}
@@ -341,7 +341,7 @@ func main() {
 	writeTestModule(t, tmpDir, mainContent)
 
 	// Must not panic or hang
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
 	}
@@ -393,7 +393,7 @@ func main() {
 `
 	writeTestModule(t, tmpDir, mainContent)
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall")
 	}

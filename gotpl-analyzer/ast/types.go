@@ -116,7 +116,7 @@ type FuncMapInfo struct {
 	// DefCol is the column number where the function is defined.
 	DefCol int `json:"defCol,omitempty"`
 
-	// Fields of the primary return type after unwrapping pointer and slice.
+	// ReturnTypeFields contains the fields of the primary return type after unwrapping pointer and slice.
 	// e.g. func() *[]MgtHints → fields of MgtHints.
 	// The TypeScript extension uses this to provide intellisense inside
 	// {{ range $hints }} without needing a separate render-call entry.
@@ -139,37 +139,57 @@ type ParamInfo struct {
 	Doc string `json:"doc,omitempty"`
 }
 
-// AnalysisConfig defines customizable function and type names used by the analyzer to identify template-related constructs.
+// AnalysisConfig defines customizable function and type names used by the analyzer
+// to identify template-related constructs across any Go web framework or standard library.
 type AnalysisConfig struct {
-	// RenderFunctionName is the name of the function or method used to render templates (default: "Render").
-	RenderFunctionName string
-	// ExecuteTemplateFunctionName is an alternative function name for rendering templates (default: "ExecuteTemplate").
-	ExecuteTemplateFunctionName string
-	// SetFunctionName is the name of the method used to explicitly set context variables within a template (default: "Set").
-	SetFunctionName string
-	// ContextTypeName is the name of the Go type that represents the template execution context (default: "Context").
-	ContextTypeName string
+	// RenderFunctionNames lists function or method names used to render templates
+	// (default: ["Render", "ExecuteTemplate", "Execute", "HTML", "RenderTemplate", "View", "Template"]).
+	RenderFunctionNames []string `json:"renderFunctionNames"`
+
+	// SetFunctionNames lists method names used to set context variables (e.g. ["Set", "Locals", "SetVar", "With"]).
+	SetFunctionNames []string `json:"setFunctionNames"`
+
+	// ContextTypeNames lists Go type names that represent template execution contexts
+	// (e.g., ["Context", "Ctx", "fiber.Ctx", "gin.Context", "echo.Context"]).
+	ContextTypeNames []string `json:"contextTypeNames"`
+
 	// GlobalTemplateName is the special key used in the context file to define global template variables (default: "global").
-	GlobalTemplateName string
+	GlobalTemplateName string `json:"globalTemplateName"`
+
+	// Legacy single-string fields preserved for backwards-compatibility:
+	RenderFunctionName          string `json:"-"`
+	ExecuteTemplateFunctionName string `json:"-"`
+	SetFunctionName             string `json:"-"`
+	ContextTypeName             string `json:"-"`
 }
 
-// DefaultConfig provides the default configuration for the go template LSP,
-// tailored for common go template conventions.
+// DefaultConfig provides framework-agnostic defaults for Go standard library,
+// Gin, Fiber, Echo, Chi, and custom render engines.
 var DefaultConfig = AnalysisConfig{
+	RenderFunctionNames: []string{
+		"Render", "ExecuteTemplate", "Execute", "HTML", "RenderTemplate", "View", "Template",
+	},
 	RenderFunctionName:          "Render",
 	ExecuteTemplateFunctionName: "ExecuteTemplate",
-	SetFunctionName:             "Set",
-	ContextTypeName:             "Context",
-	GlobalTemplateName:          "global",
+	SetFunctionNames: []string{
+		"Set", "Locals", "SetVar", "SetContext", "With",
+	},
+	SetFunctionName: "Set",
+	ContextTypeNames: []string{
+		"Context", "Ctx", "fiber.Ctx", "gin.Context", "c.HTML", "echo.Context",
+	},
+	ContextTypeName:    "Context",
+	GlobalTemplateName: "global",
 }
 
 // FuncScope encapsulates all template-related operations within a single
 // function or code block scope.
 type FuncScope struct {
-	SetVars        []TemplateVar                  // Template variables set via context.Set()
-	RenderNodes    []ResolvedRender               // Template render calls found
-	FuncMaps       []FuncMapInfo                  // Function map definitions
-	MapAssignments map[string]*goast.CompositeLit // Map variable name → composite literal
+	SetVars           []TemplateVar                  // Template variables set via context.Set() or context.Locals()
+	RenderNodes       []ResolvedRender               // Template render calls found
+	FuncMaps          []FuncMapInfo                  // Function map definitions
+	MapAssignments    map[string]*goast.CompositeLit // Map variable name → composite literal
+	StructAssignments map[string]*goast.CompositeLit // Struct variable name → composite literal
 }
 
 // ResolvedRender represents a template render call with resolved template
@@ -178,6 +198,7 @@ type ResolvedRender struct {
 	Node           *goast.CallExpr // The actual call expression
 	TemplateNames  []string        // Resolved template name(s)
 	TemplateArgIdx int             // Index of template name argument
+	DataArgIdx     int             // Index of data context argument
 }
 
 // funcWorkUnit wraps an AST node for concurrent processing.

@@ -74,7 +74,7 @@ go 1.21
 		t.Fatalf("failed to write go.mod: %v", err)
 	}
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 
 	if len(result.RenderCalls) == 0 {
 		t.Fatal("expected at least one RenderCall, got 0")

@@ -62,7 +62,7 @@ func handler(c *Context, request *Request) {
 		t.Fatal(err)
 	}
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 	if len(result.Errors) > 0 {
 		t.Fatalf("analysis errors: %v", result.Errors)
 	}
@@ -139,7 +139,7 @@ func handler(c *Context, page string) {
 		t.Fatal(err)
 	}
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 	if len(result.Errors) > 0 {
 		t.Fatalf("analysis errors: %v", result.Errors)
 	}
@@ -193,7 +193,7 @@ func handler(c *Context) {
 		t.Fatal(err)
 	}
 
-	result := AnalyzeDir(tmpDir, "", DefaultConfig)
+	result := AnalyzeDir(tmpDir, "", &DefaultConfig)
 	if len(result.Errors) > 0 {
 		t.Fatalf("analysis errors: %v", result.Errors)
 	}

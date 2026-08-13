@@ -762,7 +762,7 @@ func isFunctionIdentifier(value string) bool {
 func buildRootScope(varMap map[string]ast.TemplateVar) ScopeType {
 	// If the context was passed as a single value (e.g. via a partial call),
 	// use it directly as the root scope.
-	if dot, ok := varMap["."]; ok {
+	if dot, ok := varMap["."]; ok && len(varMap) == 1 {
 		return ScopeType{
 			IsRoot:   true,
 			TypeStr:  dot.TypeStr,
@@ -780,6 +780,9 @@ func buildRootScope(varMap map[string]ast.TemplateVar) ScopeType {
 	}
 
 	for name, v := range varMap {
+		if name == "." {
+			continue
+		}
 		rootScope.Fields = append(rootScope.Fields, ast.FieldInfo{
 			Name:     name,
 			TypeStr:  v.TypeStr,

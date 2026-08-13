@@ -20,7 +20,7 @@ func enrichRenderCallsWithContext(
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	fset *token.FileSet,
-	config AnalysisConfig,
+	config *AnalysisConfig,
 	seenPool *seenMapPool,
 ) []RenderCall {
 	data, err := os.ReadFile(contextFile)
@@ -160,7 +160,7 @@ func addSyntheticCalls(
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	fset *token.FileSet,
-	config AnalysisConfig,
+	config *AnalysisConfig,
 	seenPool *seenMapPool,
 	seenTpls map[string]bool,
 ) []RenderCall {

@@ -2,32 +2,56 @@
 
 ![LOGO](./extension/logo.png)
 
-Bring the power of Go's static typing directly into your HTML templates. 
+Bring the power of Go's static typing directly into your HTML and text templates.
 
-**Go Template LSP** is a powerful VS Code extension and standalone Go analyzer that provides real-time validation, rich IntelliSense, and seamless navigation for Go `html/template` and `text/template` files.
+**Go Template LSP** is a high-performance VS Code extension and standalone Go analyzer that provides real-time type-safe validation, sub-millisecond IntelliSense, rich documentation hovers, and seamless cross-file navigation for Go `html/template` and `text/template` files.
 
+If you've ever been frustrated by discovering template typos, missing variables, invalid field accesses, or type mismatches only *after* compiling and running your server, this extension is for you.
 
-
-If you've ever been frustrated by discovering template typos, missing variables, or type mismatches only *after* compiling and running your server, this extension is for you.
+---
 
 ## 🚀 Key Features
 
-*   **Framework Agnostic**: Works out-of-the-box with any Go web framework (Fiber, Echo, Gin, Chi, standard library) as long as you use standard render patterns (e.g., `Render(name, data)` or `ExecuteTemplate(wr, name, data)`).
-*   **Live Type-Safe Validation**: Detects missing variables, undefined struct fields, and type mismatches as you type. No more runtime panics for missing fields!
-*   **Rich IntelliSense & Hover**: Hover over any `{{ .Variable }}` in your HTML to see its underlying Go type, documentation, and available fields. Trigger autocomplete to explore nested structs, maps, and slices.
-*   **Deep Scope Understanding**: Correctly tracks the `.` context through `{{ range }}`, `{{ with }}`, and `{{ if }}` blocks. Fully supports local variable assignments (`{{ $v := . }}`).
-*   **Cross-File Block Resolution**: Fully understands `{{ define "name" }}` and `{{ block "name" . }}` across your entire project. It aggregates context from all call sites to provide accurate autocompletion inside shared partials.
-*   **Function & Method Support**: Understands both built-in template functions (`len`, `index`, `dict`, `html`, etc.) and your custom Go `FuncMap` injections.
-*   **Seamless Navigation**: 
-    *   **Go to Definition**: Jump directly from a template variable to its Go struct definition, or from a `{{ template "name" }}` call to the file where it's defined.
-    *   **Go to Render Call**: Right-click any template to instantly jump to the Go handler(s) that render it.
-    *   **Find References**: Find everywhere a specific template or block is used across your project.
-*   **Knowledge Graph**: Visualize the relationships between your Go handlers, templates, and injected variables via an interactive UI panel.
+*   **Framework Agnostic**: Works out-of-the-box with any Go web framework (Fiber, Echo, Gin, Chi, standard library `net/http`) using standard render patterns (e.g., `c.Render(name, data)` or `tmpl.ExecuteTemplate(wr, name, data)`).
+*   **Live Type-Safe Validation**: Detects missing variables, undefined struct fields, invalid map lookups, and type mismatches as you type.
+*   **Instant Sub-Millisecond Hover & IntelliSense**:
+    *   Hover over any `{{ .Variable }}`, struct field, method, or function to view its exact Go type, parameter/return signatures, GoDoc comments, and nested field structures.
+    *   Smart autocomplete suggestions for struct fields, methods, top-level variables, block locals (`$var`), built-in template functions, and user-registered `FuncMap` functions.
+*   **Deep Scope & Context Tracking**: Accurately tracks the `.` (dot) context across complex nested structures:
+    *   `{{ range }}`, `{{ with }}`, and `{{ if }}` blocks.
+    *   Extended `else` branches: `{{ else if }}`, `{{ else with $v := . }}`, and `{{ else range $k, $v := . }}`.
+    *   Local variable declarations and multi-variable assignments (`{{ $x := .Name }}`, `{{ $k, $v := .Map }}`).
+*   **Cross-File Block Resolution**: Full awareness of `{{ define "name" }}` and `{{ block "name" . }}` across the entire workspace. Aggregates call-site arguments from parent templates to provide type inference and autocomplete inside shared partial files and detached define blocks.
+*   **Built-in & Custom FuncMap Support**: Full type inference for Go template built-ins (`len`, `index`, `slice`, `print`, `printf`, `println`, `html`, `js`, `urlquery`, `eq`, `ne`, `lt`, `gt`, boolean logic, arithmetic) and custom functions injected via `template.FuncMap`.
+*   **First-Class `dict` Helper Support**: Native evaluation of `(dict "key" .Value)` calls, generating on-the-fly typed structures for partials receiving composite dictionaries.
+*   **Seamless Two-Way Navigation**:
+    *   **Go to Definition (Template $\to$ Go)**: Jump directly from a template variable or field to its Go struct declaration in source code (`.go`).
+    *   **Go to Definition (Template $\to$ Template)**: Jump from a `{{ template "name" }}` call directly to its `{{ define "name" }}` declaration.
+    *   **Go to Definition (Go $\to$ Template)**: Click on a template name inside a Go handler's `Render("views/index.html", data)` call to open the template file.
+    *   **Find References**: Discover every template and block call-site across the entire workspace.
+*   **Interactive Knowledge Graph**: Visualize relationships between Go handlers, template files, data contexts, and variables in an interactive webview panel.
 
-## 🛠 Usage
+---
 
-The extension automatically activates when you open a Go or HTML/TMPL file in a workspace containing Go code. 
-If you want to install a standalone version, you can run:
+## ⚡ Performance Architecture
+
+The extension is architected for zero-latency interactive feedback:
+
+1. **In-Memory Sub-Millisecond Resolution**: Hover, autocompletion, and go-to-definition execute entirely in-memory using an optimized AST and a pre-indexed global type registry.
+2. **AST Parse Caching**: A bounded LRU cache in `TemplateParser` prevents redundant parsing of unchanged document content during cursor movements and hovers.
+3. **Pre-Indexed Partial Call Map (`partialToParents`)**: When analyzing partials or detached blocks, the extension queries an upfront call graph index instead of crawling and parsing disk files sequentially.
+4. **Persistent Go Daemon**: A long-lived Go analyzer process runs in the background communicating over stdio JSON-RPC, keeping type metadata resident and ready for live re-validations.
+5. **Incremental Template Re-Validation**: Template edits skip full Go AST re-analysis and reuse cached Go type declarations, re-validating in milliseconds.
+6. **O(1) Workspace Lookups**: Absolute file paths and named blocks are indexed into hash maps for constant-time context retrieval.
+
+---
+
+## 🛠 Installation & Usage
+
+The extension automatically activates when opening a workspace with Go files and templates (`.html`, `.tmpl`, `.gohtml`, `.tpl`).
+
+### Analyzer Installation
+The extension will automatically check for and prompt you to install the analyzer tool on startup. To install or update manually:
 
 ```bash
 go install github.com/abiiranathan/go-template-lsp/gotpl-analyzer@latest
@@ -36,165 +60,158 @@ go install github.com/abiiranathan/go-template-lsp/gotpl-analyzer@latest
 ### Available Commands
 Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and type `GoTpl`:
 
-*   **GoTpl: Rebuild Template Index**: Forces a full re-analysis of your Go source code to discover new handlers, templates, and types.
-*   **GoTpl: Validate Current Template**: Manually triggers validation for the active file.
-*   **GoTpl: Show Template Knowledge Graph**: Opens a side panel showing all templates, which Go files render them, and exactly what variables are passed to them.
-*   **GoTpl: Go to Render Call**: Jumps from the current template directly to the Go handler that renders it (also available via Right-Click Context Menu).
+*   **GoTpl: Rebuild Template Index**: Forces a full re-analysis of Go source files to discover new handlers, templates, types, and FuncMaps.
+*   **GoTpl: Validate Current Template**: Manually triggers validation diagnostics on the active editor file.
+*   **GoTpl: Show Template Knowledge Graph**: Opens an interactive visual panel detailing all templates, handler call-sites, and variable structures.
+
+---
 
 ## ⚙️ Configuration
 
-You can customize the extension via your `settings.json`:
+Customize the extension behavior in your VS Code `settings.json`:
 
-```json
+```jsonc
 {
-  "gotpl.enabled": true,                // Enable or disable the extension entirely
-  "gotpl.goAnalyzerPath": "",           // Path to the gotpl analyzer binary. Leave empty to use the bundled binary.
-  "gotpl.sourceDir": ".",               // Go source directory relative to the workspace root
-  "gotpl.templateRoot": "views",        // Root directory for templates, relative to sourceDir
-  "gotpl.templateBaseDir": "",          // Base directory for templates (overrides workspace root)
-  "gotpl.contextFile": "",              // Path to a JSON file with additional context variables (e.g. injected by middleware)
-  "gotpl.debounceMs": 800,              // Delay in ms before live validation triggers (default: 800)
-  "gotpl.validate": true,               // Toggle live diagnostics on/off
-  "gotpl.compress": false,              // Enable GZIP compression from the analyzer
-  "gotpl.showCallSiteErrors": false     // Show errors at partial call sites in addition to the source location
+  // Enable or disable the extension features
+  "gotpl.enabled": true,
+
+  // Custom path to the gotpl-analyzer binary.
+  "gotpl.goAnalyzerPath": "",
+
+  // Go source directory relative to the workspace root
+  "gotpl.sourceDir": ".",
+
+  // Root directory for templates relative to sourceDir or templateBaseDir
+  "gotpl.templateRoot": "views",
+
+  // Base directory for templates (if located outside sourceDir)
+  "gotpl.templateBaseDir": "",
+
+  // Path to an optional JSON file with global context variables (e.g. middleware variables)
+  "gotpl.contextFile": "",
+
+  // Debounce delay in milliseconds before live diagnostics trigger on edit
+  "gotpl.debounceMs": 800,
+
+  // Enable or disable live template validation diagnostics
+  "gotpl.validate": true,
+
+  // Enable GZIP compression between the Go analyzer daemon and the editor (useful for massive codebases)
+  "gotpl.compress": false,
+
+  // Show validation errors at partial call sites in addition to the source definition site
+  "gotpl.showCallSiteErrors": false
 }
 ```
 
-### Performance
+---
 
-The extension uses several strategies to keep analysis fast, even on large projects:
+## 💻 Standalone CLI Tool (CI/CD Quality Gate)
 
-*   **Daemon mode**: The Go analyzer runs as a persistent JSON-RPC daemon over stdin/stdout, avoiding cold-boot overhead on every keystroke.
-*   **Incremental analysis**: When only template files change, the analyzer skips the expensive `packages.Load` step and re-validates using cached Go type information (5-10× faster).
-*   **File change detection**: The daemon tracks file modification times via content fingerprinting and skips re-analysis entirely when nothing has changed.
-*   **Async startup**: The extension activates immediately and runs initial analysis in the background, so VS Code stays responsive.
-
-**Tip**: For very large projects, set `"gotpl.debounceMs": 1500` to reduce how often re-analysis triggers while typing.
-
-## 💻 CLI Tool
-
-The core engine is written in Go and can be used in CI/CD pipelines as a standalone CLI tool to enforce template safety:
+The core analyzer engine can run in standalone CLI mode to validate all templates in continuous integration pipelines:
 
 ```bash
-cd analyzer
-go build -o gotpl-analyzer .
-./gotpl-analyzer -dir /path/to/your/project -validate
+# Install analyzer
+go install github.com/abiiranathan/go-template-lsp/gotpl-analyzer@latest
+
+# Run validation across your project
+gotpl-analyzer -dir . -template-root views -validate
 ```
 
-Available flags:
-```txt
-Usage of ./gotpl-analyzer:
-  -compress
-    	Output gzip-compressed JSON
-  -context-file string
-    	Path to JSON file with additional context variables
-  -daemon
-    	Run as a long-lived JSON-RPC daemon over stdio
+### CLI Flags
+```text
+Usage of gotpl-analyzer:
   -dir string
-    	Go source directory to analyze (default ".")
-  -named-templates
-    	Return all named template as JSON
-  -template-base-dir string
-    	Base directory for template-root
+        Go source directory to analyze (default ".")
   -template-root string
-    	Root directory for templates
+        Root directory for templates (relative to dir or template-base-dir)
+  -template-base-dir string
+        Base directory for template-root (if different from -dir)
   -validate
-    	Validate templates against render calls
+        Validate template files against discovered Go render calls
+  -context-file string
+        Path to JSON file containing additional global context variables
+  -compress
+        Output gzip-compressed JSON responses
+  -daemon
+        Run as a long-lived JSON-RPC daemon over stdio
+  -named-templates
+        Output all discovered named templates and blocks as JSON
   -view-context string
-    	Show context for a specific template
-
+        Print resolved variable context for a specific template path
 ```
 
-## 🏗 Development & Building
+---
+
+## 🏗 Technical Architecture
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│                   VS Code Extension (TypeScript)                 │
+│                                                                  │
+│  ┌───────────────────────┐             ┌──────────────────────┐  │
+│  │   TemplateParser      │             │ KnowledgeGraphBuilder│  │
+│  │  (LRU AST Caching)    │             │ (Contexts & Types)   │  │
+│  └───────────┬───────────┘             └──────────┬───────────┘  │
+│              │                                    │              │
+│  ┌───────────▼───────────┐             ┌──────────▼───────────┐  │
+│  │     ScopeUtils        │             │   TypeInferencer     │  │
+│  │(Scope & Dot Tracking) │             │ (Expression Engine)  │  │
+│  └───────────┬───────────┘             └──────────┬───────────┘  │
+│              │                                    │              │
+│  ┌───────────▼────────────────────────────────────▼───────────┐  │
+│  │  Providers: Hover | Completion | Definition | References   │  │
+│  └───────────────────────────────┬────────────────────────────┘  │
+└──────────────────────────────────┼───────────────────────────────┘
+                                   │
+                     JSON-RPC 2.0  │ (Stdio IPC)
+                     Async Fallback│ Live Diagnostics
+                                   │
+┌──────────────────────────────────▼───────────────────────────────┐
+│                     Go Analyzer Daemon (Go)                      │
+│                                                                  │
+│  ┌───────────────────────┐             ┌──────────────────────┐  │
+│  │ go/types & go/parser  │             │   RenderCall Miner   │  │
+│  │ (Full Go Type Engine) │             │ (AST Handler Search) │  │
+│  └───────────────────────┘             └──────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Core Client Subsystems
+
+*   **`KnowledgeGraphBuilder`**: Constructs and maintains the project-wide call graph connecting Go handlers, render calls, template files, named blocks, FuncMaps, and global struct definitions.
+*   **`TemplateParser`**: High-speed recursive descent parser outputting nested AST nodes with full support for Go template block semantics (`range`, `with`, `if`, `block`, `define`, `assignment`).
+*   **`TypeInferencer`**: Expression engine capable of evaluating chained method invocations, pipeline stages (`.Data | func`), slice indexing, map key access, pointer stripping, and operator return types.
+*   **`ScopeUtils`**: Manages cursor-position scope stacks, resolving lexical variable scopes, local identifiers (`$var`), and block-inherited context frames.
+
+---
+
+## 🛠 Development & Contributing
 
 ### Prerequisites
-*   Go 1.25+
-*   Node.js & npm
+*   **Go**: 1.22+
+*   **Node.js**: 18.x or 20.x
+*   **npm** or **pnpm**
 
-### Build Instructions
-To debug in VS Code:
-1. Open the `extension` folder.
-2. Press `F5` to launch the Extension Development Host.
+### Quick Start
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/abiiranathan/go-template-lsp.git
+   cd go-template-lsp
+   ```
+2. Install extension dependencies:
+   ```bash
+   npm install
+   ```
+3. Run test suites:
+   ```bash
+   npm test
+   ```
+4. Launch Extension Development Host:
+   * Press `F5` in VS Code to start a development window with the extension loaded.
+
+---
 
 ## 📄 License
 
 MIT © [Dr. Abiira Nathan](https://github.com/abiiranathan)
-
-# Technical Architecture: Go Template LSP
-
-The Go Template LSP bridges the gap between statically typed Go source code and dynamically evaluated Go templates. To achieve high performance, live diagnostics, and deep AST understanding, the project is split into two communicating components: a **Go Analyzer Daemon** and a **TypeScript VS Code Extension**.
-
-## 1. System Overview
-
-```text
-┌───────────────────────┐          JSON-RPC via stdin/stdout         ┌────────────────────────┐
-│                       │ ◄───────────────────────────────────────── │                        │
-│  TypeScript Extension │                                            │   Go Analyzer Daemon   │
-│  (VS Code UI, Cache,  │ ─────────────────────────────────────────► │   (Go AST parsing,     │
-│   Knowledge Graph)    │                                            │    Type extraction)    │
-└───────────────────────┘                                            └────────────────────────┘
-```
-
-## 2. The Go Analyzer (Backend)
-
-Written in Go, the analyzer uses the `go/ast`, `go/parser`, and `go/types` packages to deeply understand the user's Go project.
-
-### Responsibilities
-*   **Render Call Extraction**: Walks the Go AST looking for calls to `c.Render()`, `ExecuteTemplate()`, etc. It identifies the string argument (the template name) and the data argument (the context).
-*   **Type Resolution**: When a data argument is passed to a template, the analyzer resolves its exact underlying Go type (Structs, Maps, Slices). It extracts field names, types, method signatures, and GoDoc comments.
-*   **FuncMap Extraction**: Automatically discovers custom template functions injected via `template.FuncMap` and extracts their parameter and return types.
-*   **Daemon Mode**: Instead of cold-booting for every keystroke, the analyzer runs as a persistent daemon. It listens over `stdin` for JSON-RPC requests from VS Code, allowing it to validate modified template strings in memory in milliseconds.
-
-## 3. The TypeScript Extension (Client/LSP)
-
-The extension provides the Language Server Protocol (LSP) features directly to VS Code. 
-
-### Core Components
-
-#### `KnowledgeGraphBuilder`
-The central brain of the extension. During startup, it asks the Go Daemon to index the workspace. It builds an in-memory graph connecting:
-*   **Go Handlers** -> **Templates**
-*   **Templates** -> **Context Variables**
-*   **Named Blocks** (`{{ define }}` / `{{ block }}`) -> **Call Sites** (`{{ template }}`)
-
-This graph allows the extension to know *exactly* what variables are available inside a partial template based on how it was called in a completely different file.
-
-#### `TemplateParser`
-A custom recursive-descent parser written in TypeScript that generates an Abstract Syntax Tree (AST) of the HTML/Go-Template files. 
-Unlike standard regex-based parsers, this parser understands nesting. It knows that a variable inside `{{ range .Users }}` belongs to a child scope where `.` represents a `User` struct.
-
-#### `TypeInferencer` (`expressionParser.ts`)
-A sophisticated type-inference engine for Go template syntax. If a user types `{{ (index .Users 0).GetProfile.Avatar }}`, the inferencer:
-1. Resolves `.Users` to `[]User`.
-2. Evaluates the `index` built-in function to extract the element type `User`.
-3. Resolves the `.GetProfile` method, looking up its return type `Profile`.
-4. Resolves the `.Avatar` field on the `Profile` struct, determining it is a `string`.
-
-It handles map lookups, slice indexing, pointer dereferencing, custom `FuncMap` calls, and complex pipelines (`.Count | add 5 | printf "%d"`).
-
-#### `ScopeUtils`
-Handles the dynamic nature of the `.` (dot) context in Go templates. It traverses the AST downwards to the cursor position, pushing and popping `ScopeFrame` objects. It accurately tracks:
-*   Local variable assignments (`{{ $val := .Name }}`).
-*   Range loops with keys and values (`{{ range $k, $v := .Map }}`).
-*   Context overrides (`{{ with .NestedStruct }}`).
-
-### 4. How Language Features Work
-
-*   **Live Diagnostics (Squiggly Lines)**: On every keystroke (debounced), the TS extension sends the current document text to the Go Daemon. The daemon parses the template, validates field accesses against the extracted Go types, and returns a list of errors.
-
-*   **Hover & Autocomplete**: 
-    1. VS Code asks for hover info at `line: 10, col: 15`.
-    2. The `ScopeUtils` walks the AST to find the exact node and calculates the active scope stack.
-    3. The `TypeInferencer` evaluates the path typed so far.
-    4. The extension looks up the resulting type in the `KnowledgeGraph` and formats the fields, methods, and documentation into a rich Markdown tooltip or a list of Completion Items.
-*   **Go to Definition**: 
-    1. Resolves the type at the cursor.
-    2. Looks up the `defFile`, `defLine`, and `defCol` metadata extracted by the Go Analyzer.
-    3. Opens the original `.go` source file right to the struct field definition.
-
-## 5. Notable Technical Challenges Solved
-
-*   **Cross-File Block Context**: In Go, `{{ define "header" }}` rarely has its own context. It inherits context from wherever `{{ template "header" . }}` is called. The `KnowledgeGraph` parallel-scans all templates to find call sites, merges the context variables passed to them, and artificially injects that context into the `define` block for accurate intellisense.
-*   **The `dict` Pattern**: A common workaround in Go templates is passing multiple variables via a map function: `{{ template "x" (dict "User" .User "Count" 5) }}`. The `TypeInferencer` natively understands the `dict` built-in, creating on-the-fly anonymous structs so autocomplete works flawlessly inside the child template.
-*   **Automatic Pointer Dereferencing**: Go templates automatically dereference pointers (e.g., `*User` -> `User`). The type inferencer mimics this behavior, aggressively stripping `*` prefixes during path resolution so nested field lookups don't fail.
-

@@ -4,6 +4,7 @@ import (
 	goast "go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 	"strings"
 )
 
@@ -76,6 +77,7 @@ func processFunc(
 }
 
 // processAssignStmt handles assignment statements.
+// processAssignStmt handles assignment statements.
 func processAssignStmt(
 	assign *goast.AssignStmt,
 	info *types.Info,
@@ -89,19 +91,22 @@ func processAssignStmt(
 	seenPool *seenMapPool,
 	stringMapIndex map[string][]string,
 ) {
-	// ── Special case: map-index read  `v, ok := someMap[key]` ───────────────
+	// ── Special case: map-index read `v, ok := someMap[key]` or `v, ok := pkg.someMap[key]` ───────────────
 	if assign.Tok == token.DEFINE || assign.Tok == token.ASSIGN {
 		if len(assign.Rhs) == 1 {
 			if idx, ok := assign.Rhs[0].(*goast.IndexExpr); ok {
-				if ident, ok := idx.X.(*goast.Ident); ok {
-					if vals, found := stringMapIndex[ident.Name]; found {
+				mapName := extractIdentOrSelectorName(idx.X)
+				if mapName != "" {
+					if vals, found := stringMapIndex[mapName]; found {
 						if len(assign.Lhs) >= 1 {
 							if lhsIdent, ok := assign.Lhs[0].(*goast.Ident); ok && lhsIdent.Name != "_" {
-								if len(stringAssignments[lhsIdent.Name]) < MaxAssignmentsPerVar {
-									stringAssignments[lhsIdent.Name] = append(
-										stringAssignments[lhsIdent.Name],
-										vals...,
-									)
+								for _, val := range vals {
+									if !sliceContains(stringAssignments[lhsIdent.Name], val) && len(stringAssignments[lhsIdent.Name]) < MaxAssignmentsPerVar {
+										stringAssignments[lhsIdent.Name] = append(
+											stringAssignments[lhsIdent.Name],
+											val,
+										)
+									}
 								}
 							}
 						}
@@ -133,7 +138,7 @@ func processAssignStmt(
 		}
 
 		if s := extractStringFast(rhs); s != "" {
-			if len(stringAssignments[ident.Name]) < MaxAssignmentsPerVar {
+			if !sliceContains(stringAssignments[ident.Name], s) && len(stringAssignments[ident.Name]) < MaxAssignmentsPerVar {
 				stringAssignments[ident.Name] = append(stringAssignments[ident.Name], s)
 			}
 		}
@@ -148,6 +153,21 @@ func processAssignStmt(
 			}
 		}
 	}
+}
+
+func extractIdentOrSelectorName(expr goast.Expr) string {
+	switch e := expr.(type) {
+	case *goast.Ident:
+		return e.Name
+	case *goast.SelectorExpr:
+		return e.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func sliceContains(slice []string, val string) bool {
+	return slices.Contains(slice, val)
 }
 
 // trackMapIndexAssign records an index-assignment mutation on a map variable.

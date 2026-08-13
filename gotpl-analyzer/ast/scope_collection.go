@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+// collectFuncScopesOptimized efficiently collects template operations from
+// all function and variable declaration scopes using concurrent processing.
 func collectFuncScopesOptimized(
 	files []*goast.File,
 	info *types.Info,
@@ -18,7 +20,6 @@ func collectFuncScopesOptimized(
 	filesMap map[string]*goast.File,
 	seenPool *seenMapPool,
 ) []FuncScope {
-	// Single fused pass over all AST files to build work units and indexes concurrently
 	funcNodes, mutatorIndex, stringMapIndex := scanFilesSinglePass(files, info)
 	if len(funcNodes) == 0 {
 		return nil
@@ -27,7 +28,8 @@ func collectFuncScopesOptimized(
 	return processNodesConcurrently(funcNodes, info, fset, structIndex, fc, config, filesMap, seenPool, mutatorIndex, stringMapIndex)
 }
 
-// scanFilesSinglePass extracts function nodes, map mutators, and string maps in 1 pass.
+// scanFilesSinglePass iterates over all AST files in 1 pass to identify work units,
+// map mutators, and string-map template lookups.
 func scanFilesSinglePass(files []*goast.File, info *types.Info) ([]funcWorkUnit, map[string][]*goast.KeyValueExpr, map[string][]string) {
 	funcNodes := make([]funcWorkUnit, 0, len(files)*8)
 	mutatorIndex := make(map[string][]*goast.KeyValueExpr)
@@ -89,7 +91,7 @@ func scanFilesSinglePass(files []*goast.File, info *types.Info) ([]funcWorkUnit,
 					funcNodes = append(funcNodes, funcWorkUnit{node: node})
 				}
 
-				// String map index collection for package-level maps
+				// String map index collection for package-level maps (e.g. var LabViewTemplates = ...)
 				if node.Tok == token.VAR {
 					for _, spec := range node.Specs {
 						vspec, ok := spec.(*goast.ValueSpec)
@@ -105,38 +107,64 @@ func scanFilesSinglePass(files []*goast.File, info *types.Info) ([]funcWorkUnit,
 								continue
 							}
 
-							isValidMap := false
-							if info != nil {
-								if obj, ok := info.Defs[name]; ok && obj != nil {
-									isValidMap = isMapToStringType(obj.Type())
-								} else {
-									isValidMap = isMapToStringLitType(comp)
-								}
-							} else {
-								isValidMap = isMapToStringLitType(comp)
-							}
-
-							if isValidMap {
-								var vals []string
-								for _, elt := range comp.Elts {
-									if kv, ok := elt.(*goast.KeyValueExpr); ok {
-										if s := extractStringFast(kv.Value); s != "" {
-											vals = append(vals, s)
-										}
-									}
-								}
-								if len(vals) > 0 {
-									stringMapIndex[name.Name] = vals
-								}
-							}
+							collectStringMapLiteral(name.Name, comp, info, stringMapIndex)
 						}
 					}
 				}
 			}
 		}
+
+		// Inspect file for AssignStmts assigning map composite literals (e.g. api.LabViewTemplates = ...)
+		goast.Inspect(f, func(n goast.Node) bool {
+			if assign, ok := n.(*goast.AssignStmt); ok {
+				for i, lhs := range assign.Lhs {
+					if i >= len(assign.Rhs) {
+						continue
+					}
+					mapName := extractIdentOrSelectorName(lhs)
+					if mapName != "" {
+						if comp, ok := assign.Rhs[i].(*goast.CompositeLit); ok {
+							collectStringMapLiteral(mapName, comp, info, stringMapIndex)
+						}
+					}
+				}
+			}
+			return true
+		})
 	}
 
 	return funcNodes, mutatorIndex, stringMapIndex
+}
+
+func collectStringMapLiteral(name string, comp *goast.CompositeLit, info *types.Info, index map[string][]string) {
+	if info != nil {
+		if tv, ok := info.Types[comp]; ok && tv.Type != nil {
+			if !isMapToStringType(tv.Type) {
+				return
+			}
+		} else if !isMapToStringLitType(comp) {
+			return
+		}
+	} else if !isMapToStringLitType(comp) {
+		return
+	}
+
+	var vals []string
+	for _, elt := range comp.Elts {
+		if kv, ok := elt.(*goast.KeyValueExpr); ok {
+			if s := extractStringFast(kv.Value); s != "" {
+				vals = append(vals, s)
+			}
+		}
+	}
+
+	if len(vals) > 0 {
+		for _, val := range vals {
+			if !sliceContains(index[name], val) {
+				index[name] = append(index[name], val)
+			}
+		}
+	}
 }
 
 // processNodesConcurrently distributes work units across multiple workers
@@ -183,7 +211,6 @@ func processNodesConcurrently(
 }
 
 // processChunk is the worker function that processes a chunk of AST nodes.
-// Each worker operates independently with no shared mutable state.
 func processChunk(
 	chunk []funcWorkUnit,
 	info *types.Info,
@@ -227,7 +254,7 @@ func isMapToStringType(t types.Type) bool {
 }
 
 // isMapToStringLitType is a best-effort AST-only check: it looks at the
-// composite literal's type node for the pattern map[…]string.
+// composite literal's type node for the pattern map[...]string.
 func isMapToStringLitType(comp *goast.CompositeLit) bool {
 	if comp.Type == nil {
 		return false
@@ -269,11 +296,6 @@ func isMapStringAnyParam(field *goast.Field, info *types.Info) bool {
 // applyMapMutatorCall checks whether a call expression invokes a known
 // map-mutating helper (present in mutatorIndex) and, if so, merges its
 // recorded key/value mutations into the caller's tracked map variable.
-//
-// Example: given  ctx := rex.Map{"a": 1}  followed by  SetTriageContext(ctx, ...)
-// and mutatorIndex["SetTriageContext"] = [{"visit":visit}, {"triage":triage}, ...]
-// the function appends those pairs to ctx's composite literal so that downstream
-// extractMapVars sees the full set of keys.
 func applyMapMutatorCall(
 	call *goast.CallExpr,
 	scope *FuncScope,

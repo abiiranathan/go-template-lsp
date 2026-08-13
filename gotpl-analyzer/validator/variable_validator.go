@@ -262,10 +262,10 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 			return nil
 		}
 
-		// Only report an error when we have concrete field metadata for the root
-		// scope. When the scope is unresolved (empty fields) stay permissive to
-		// avoid false positives from partials rendered from multiple templates.
-		if len(rootScope.Fields) == 0 && len(varMap) == 0 {
+		// Only report an error when we have concrete field metadata for the root scope.
+		// When scope fields are empty, stay permissive to avoid false positives
+		// on unhydrated partial contexts.
+		if len(rootScope.Fields) == 0 {
 			return nil
 		}
 

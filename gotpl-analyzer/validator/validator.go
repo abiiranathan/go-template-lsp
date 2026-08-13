@@ -33,19 +33,24 @@ func ValidateTemplates(
 ) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
 	funcMapRegistry := BuildFuncMapRegistry(funcMaps)
 
+	// Single disk walk: load all template contents into memory once
 	store := LoadTemplateStore(baseDir, templateRoot)
 
+	// Parse named blocks using the in-memory template store
 	namedBlocks, namedBlockErrors := parseAllNamedTemplatesFromStore(store, baseDir, templateRoot)
 
-	// Build template-name → merged var list WITH partial/block propagation
+	// Build template-name → merged var list WITH full partial/block propagation
 	renderVarsByTemplate := BuildPropagatedRenderVarIndex(renderCalls, namedBlocks, baseDir, templateRoot, funcMapRegistry, store)
 
 	partialTargets := findPartialTargetsFromStore(store)
 
-	renderErrors := validateRenderCallsConcurrently(store, renderCalls, baseDir, templateRoot, namedBlocks, partialTargets, funcMapRegistry)
+	// Pass the propagated renderVarsByTemplate to validateRenderCallsConcurrently!
+	renderErrors := validateRenderCallsConcurrently(store, renderCalls, renderVarsByTemplate, baseDir, templateRoot, namedBlocks, partialTargets, funcMapRegistry)
 
+	// Validate all un-rendered files in the tree from memory
 	treeErrors := validateTemplateTreeFromStore(store, baseDir, templateRoot, namedBlocks, renderVarsByTemplate, partialTargets, funcMapRegistry)
 
+	// Validate orphaned named blocks
 	blockErrors := validateOrphanedNamedBlocks(namedBlocks, renderVarsByTemplate, baseDir, templateRoot, partialTargets, funcMapRegistry)
 
 	allErrors := append(renderErrors, treeErrors...)
@@ -65,7 +70,6 @@ func BuildFuncMapRegistry(funcMaps []ast.FuncMapInfo) FuncMapRegistry {
 var templateRegex = regexp.MustCompile(`\{\{-?\s*(?:template|block|define)\s+["'\x60]([^"'\x60]+)["'\x60]`)
 
 // FindPartialTargets scans all template files to find targets of {{template "..."}} or {{block "..."}} calls.
-// Exported for daemon and external callers.
 func FindPartialTargets(baseDir, templateRoot string) map[string]bool {
 	store := LoadTemplateStore(baseDir, templateRoot)
 	return findPartialTargetsFromStore(store)
@@ -99,6 +103,50 @@ func LoadTemplateStore(baseDir, templateRoot string) TemplateStore {
 		return nil
 	})
 	return store
+}
+
+func parseAllNamedTemplatesFromStore(store TemplateStore, baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
+	root := filepath.Join(baseDir, templateRoot)
+	registry := make(map[string][]NamedBlockEntry)
+
+	for path, content := range store {
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			rel = path
+		}
+		rel = filepath.ToSlash(rel)
+
+		local := make(map[string][]NamedBlockEntry)
+		extractNamedTemplatesFromContent(content, path, rel, local)
+
+		for name, entries := range local {
+			registry[name] = append(registry[name], entries...)
+		}
+	}
+
+	errors := detectDuplicateBlocks(registry)
+	return registry, errors
+}
+
+// buildRenderVarIndex creates a lookup: template-name → merged TemplateVar list.
+func buildRenderVarIndex(renderCalls []ast.RenderCall) map[string][]ast.TemplateVar {
+	idx := make(map[string][]ast.TemplateVar, len(renderCalls))
+	seen := make(map[string]map[string]bool, len(renderCalls))
+
+	for _, rc := range renderCalls {
+		if _, ok := idx[rc.Template]; !ok {
+			idx[rc.Template] = nil
+			seen[rc.Template] = make(map[string]bool)
+		}
+		for _, v := range rc.Vars {
+			if !seen[rc.Template][v.Name] {
+				seen[rc.Template][v.Name] = true
+				idx[rc.Template] = append(idx[rc.Template], v)
+			}
+		}
+	}
+
+	return idx
 }
 
 // BuildPropagatedRenderVarIndex creates a template-name → merged TemplateVar map.
@@ -218,50 +266,6 @@ func mergeVarsIntoIndex(idx map[string][]ast.TemplateVar, key string, newVars []
 	return changed
 }
 
-func parseAllNamedTemplatesFromStore(store TemplateStore, baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
-	root := filepath.Join(baseDir, templateRoot)
-	registry := make(map[string][]NamedBlockEntry)
-
-	for path, content := range store {
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			rel = path
-		}
-		rel = filepath.ToSlash(rel)
-
-		local := make(map[string][]NamedBlockEntry)
-		extractNamedTemplatesFromContent(content, path, rel, local)
-
-		for name, entries := range local {
-			registry[name] = append(registry[name], entries...)
-		}
-	}
-
-	errors := detectDuplicateBlocks(registry)
-	return registry, errors
-}
-
-// buildRenderVarIndex creates a lookup: template-name → merged TemplateVar list.
-func buildRenderVarIndex(renderCalls []ast.RenderCall) map[string][]ast.TemplateVar {
-	idx := make(map[string][]ast.TemplateVar, len(renderCalls))
-	seen := make(map[string]map[string]bool, len(renderCalls))
-
-	for _, rc := range renderCalls {
-		if _, ok := idx[rc.Template]; !ok {
-			idx[rc.Template] = nil
-			seen[rc.Template] = make(map[string]bool)
-		}
-		for _, v := range rc.Vars {
-			if !seen[rc.Template][v.Name] {
-				seen[rc.Template][v.Name] = true
-				idx[rc.Template] = append(idx[rc.Template], v)
-			}
-		}
-	}
-
-	return idx
-}
-
 // validateTemplateTreeFromStore iterates over in-memory template entries and validates
 // un-rendered/non-partial templates without disk I/O.
 func validateTemplateTreeFromStore(
@@ -290,12 +294,10 @@ func validateTemplateTreeFromStore(
 		}
 		rel = filepath.ToSlash(rel)
 
-		// Skip files that are direct render-call targets — already validated
 		if isCoveredByRenderCall(rel, renderVarsByTemplate) {
 			continue
 		}
 
-		// Skip files that are used as partials — validated via their callers
 		if partialTargets[rel] {
 			continue
 		}
@@ -445,6 +447,7 @@ func runWorkers(total int, fn func([]int) []ValidationResult) []ValidationResult
 func validateRenderCallsConcurrently(
 	store TemplateStore,
 	renderCalls []ast.RenderCall,
+	renderVarsByTemplate map[string][]ast.TemplateVar, // <- USE THE PROPAGATED INDEX!
 	baseDir string,
 	templateRoot string,
 	namedBlocks map[string][]NamedBlockEntry,
@@ -455,8 +458,6 @@ func validateRenderCallsConcurrently(
 		return nil
 	}
 
-	renderVarsByTemplate := buildRenderVarIndex(renderCalls)
-
 	type workItem struct {
 		template string
 		vars     []ast.TemplateVar
@@ -466,6 +467,11 @@ func validateRenderCallsConcurrently(
 	seen := make(map[string]bool)
 	var items []workItem
 	for _, rc := range renderCalls {
+		// Skip artificial daemon context calls used for variable transmission
+		if rc.File == "template-call" || rc.File == "context-file" {
+			continue
+		}
+
 		if seen[rc.Template] {
 			continue
 		}
@@ -473,9 +479,16 @@ func validateRenderCallsConcurrently(
 		if _, isNamedBlock := namedBlocks[rc.Template]; isNamedBlock && partialTargets[rc.Template] {
 			continue
 		}
+
+		// Use propagated renderVarsByTemplate if available, fallback to rc.Vars
+		vars := renderVarsByTemplate[rc.Template]
+		if len(vars) == 0 {
+			vars = rc.Vars
+		}
+
 		items = append(items, workItem{
 			template: rc.Template,
-			vars:     renderVarsByTemplate[rc.Template],
+			vars:     vars,
 			rc:       rc,
 		})
 	}
@@ -557,14 +570,9 @@ func ValidateTemplateFile(
 	}
 
 	varMap := buildVarMap(vars)
-	contentStr := string(content)
-
-	// Merge once here; all recursive calls through validateTemplateContentWithRegistry
-	// will use this registry without re-merging.
-	effectiveRegistry := mergeNamedBlockRegistry(registry, contentStr, templateName)
-
+	effectiveRegistry := mergeNamedBlockRegistry(registry, string(content), templateName)
 	return validateTemplateContentWithRegistry(
-		contentStr, varMap, templateName,
+		string(content), varMap, templateName,
 		baseDir, templateRoot, 1, effectiveRegistry, effectiveFuncMaps,
 	)
 }
@@ -584,7 +592,6 @@ func findOverlayTemplateEntry(registry map[string][]NamedBlockEntry, templateNam
 	return NamedBlockEntry{}, false
 }
 
-// buildVarMap converts a slice of TemplateVar to a map for O(1) lookup.
 func buildVarMap(vars []ast.TemplateVar) map[string]ast.TemplateVar {
 	varMap := make(map[string]ast.TemplateVar, len(vars))
 	for _, v := range vars {

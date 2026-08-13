@@ -121,6 +121,9 @@ func BuildPropagatedRenderVarIndex(
 	inQueue := make(map[string]bool)
 
 	for name := range idx {
+		if name == "block" || name == "" {
+			continue
+		}
 		queue = append(queue, queueItem{name: name})
 		inQueue[name] = true
 	}
@@ -157,20 +160,15 @@ func BuildPropagatedRenderVarIndex(
 		}
 
 		varMap := buildVarMap(currentVars)
-		var scopeStack []ScopeType
-		rootScope := buildRootScope(varMap)
-		scopeStack = append(scopeStack, rootScope)
-
-		calls := extractTemplateAndBlockCalls(content)
+		calls := collectCallContextsWithScope(content, varMap, funcMaps)
 
 		for _, call := range calls {
 			targetName := call.target
-			contextArg := call.contextArg
+			if targetName == "block" || targetName == "" {
+				continue
+			}
 
-			partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
-			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-			propagatedVars := scopeVarsToTemplateVars(partialVarMap)
-
+			propagatedVars := call.vars
 			if len(propagatedVars) == 0 {
 				continue
 			}
@@ -193,52 +191,9 @@ func BuildPropagatedRenderVarIndex(
 		}
 	}
 
+	delete(idx, "block")
+	delete(idx, "")
 	return idx
-}
-
-type templateCallInfo struct {
-	target     string
-	contextArg string
-}
-
-func extractTemplateAndBlockCalls(content string) []templateCallInfo {
-	var calls []templateCallInfo
-	cur := 0
-	for cur < len(content) {
-		openRel := strings.Index(content[cur:], "{{")
-		if openRel == -1 {
-			break
-		}
-		openIdx := cur + openRel
-		closeRel := strings.Index(content[openIdx:], "}}")
-		if closeRel == -1 {
-			break
-		}
-		closeIdx := openIdx + closeRel
-
-		action := strings.TrimSpace(content[openIdx+2 : closeIdx])
-		action = strings.TrimPrefix(action, "-")
-		action = strings.TrimSuffix(action, "-")
-		action = strings.TrimSpace(action)
-
-		cur = closeIdx + 2
-
-		if strings.HasPrefix(action, "template ") || strings.HasPrefix(action, "block ") {
-			parts := parseTemplateAction(action)
-			if len(parts) >= 1 {
-				target := parts[0]
-				ctxArg := "."
-				if len(parts) >= 2 {
-					ctxArg = parts[1]
-				}
-				calls = append(calls, templateCallInfo{
-					target:     target,
-					contextArg: ctxArg,
-				})
-			}
-		}
-	}
-	return calls
 }
 
 func mergeVarsIntoIndex(idx map[string][]ast.TemplateVar, key string, newVars []ast.TemplateVar) bool {

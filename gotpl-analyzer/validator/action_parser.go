@@ -18,8 +18,14 @@ import (
 // Handles both quoted strings ("name", `name`) and unquoted identifiers.
 //
 // Thread-safety: No shared state, safe for concurrent calls.
+// parseTemplateAction parses a {{template}} or {{block}} action to extract its arguments.
 func parseTemplateAction(action string) []string {
-	rest := strings.TrimPrefix(action, "template ")
+	rest := action
+	if strings.HasPrefix(rest, "template ") {
+		rest = strings.TrimPrefix(rest, "template ")
+	} else if strings.HasPrefix(rest, "block ") {
+		rest = strings.TrimPrefix(rest, "block ")
+	}
 	rest = strings.TrimSpace(rest)
 
 	// Phase 1: extract the template name (first token, possibly quoted)
@@ -27,16 +33,14 @@ func parseTemplateAction(action string) []string {
 	remaining := rest
 
 	if len(rest) > 0 && (rest[0] == '"' || rest[0] == '`') {
-		// Quoted template name — find the closing quote
 		quoteChar := rest[0]
 		endIdx := strings.IndexByte(rest[1:], quoteChar)
 		if endIdx == -1 {
-			return []string{rest} // malformed, return as-is
+			return []string{rest}
 		}
 		tmplName = rest[1 : endIdx+1]
 		remaining = strings.TrimSpace(rest[endIdx+2:])
 	} else {
-		// Unquoted template name — take until whitespace
 		idx := strings.IndexAny(rest, " \t\n\r")
 		if idx == -1 {
 			return []string{rest}
@@ -49,7 +53,6 @@ func parseTemplateAction(action string) []string {
 		return []string{tmplName}
 	}
 
-	// Phase 2: everything after the template name is the context expression
 	return []string{tmplName, remaining}
 }
 

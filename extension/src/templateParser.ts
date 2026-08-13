@@ -1,4 +1,3 @@
-// src/templateParser.ts
 import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar, ParamInfo, extractBareType } from './types';
 
 /**
@@ -7,9 +6,30 @@ import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar, ParamInfo, extractBar
  * can push/pop scope correctly.
  */
 export class TemplateParser {
+    private static parseCache = new Map<string, TemplateNode[]>();
+    private static readonly MAX_CACHE_SIZE = 200;
+
+    static clearCache(): void {
+        TemplateParser.parseCache.clear();
+    }
+
     parse(content: string): TemplateNode[] {
+        if (!content) return [];
+        const cached = TemplateParser.parseCache.get(content);
+        if (cached) {
+            return cached;
+        }
+
         const tokens = this.tokenize(content);
         const { nodes } = this.buildTree(tokens, 0);
+
+        if (TemplateParser.parseCache.size >= TemplateParser.MAX_CACHE_SIZE) {
+            const firstKey = TemplateParser.parseCache.keys().next().value;
+            if (firstKey !== undefined) {
+                TemplateParser.parseCache.delete(firstKey);
+            }
+        }
+        TemplateParser.parseCache.set(content, nodes);
         return nodes;
     }
 

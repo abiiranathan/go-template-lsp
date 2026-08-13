@@ -1,12 +1,3 @@
-/**
- * Package scopeUtils provides shared scope resolution and AST traversal helpers
- * used by all template analysis providers (validation, hover, completion, definition).
- *
- * Nothing in this file emits diagnostics or VS Code UI objects — it is purely
- * concerned with walking the template AST and resolving types/scopes.
- */
-
-import * as fs from 'fs';
 import * as vscode from 'vscode';
 import {
     FieldInfo,
@@ -78,10 +69,15 @@ export function normalizeDictArg(contextArg: string): string {
 export class ScopeUtils {
     readonly parser: TemplateParser;
     readonly graphBuilder: KnowledgeGraphBuilder;
+    private namedBlockCallCtxCache = new Map<string, any>();
 
     constructor(parser: TemplateParser, graphBuilder: KnowledgeGraphBuilder) {
         this.parser = parser;
         this.graphBuilder = graphBuilder;
+    }
+
+    clearCache(): void {
+        this.namedBlockCallCtxCache.clear();
     }
 
     // ── Named block registry ──────────────────────────────────────────────────
@@ -969,9 +965,8 @@ export class ScopeUtils {
      * to its FieldInfo array.
      *
      * Resolution order:
-     *  1. Fields indexed inline from vars + scope frames (fast, local)
-     *  2. Global type registry from the Go analyzer (covers types whose fields
-     *     were stripped from the serialized TemplateVar to reduce payload size)
+     *  1. Fields indexed inline from local vars + scope frames (fast, local)
+     *  2. Global pre-indexed type index from KnowledgeGraph
      */
     buildFieldResolver(
         vars: Map<string, TemplateVar>,
@@ -1030,36 +1025,13 @@ export class ScopeUtils {
         }
 
         const graph = this.graphBuilder.getGraph();
-        for (const [, ctx] of graph.templates) {
-            for (const v of ctx.vars.values()) indexVar(v);
-        }
-
-        for (const [, fn] of graph.funcMaps) {
-            if (!fn.returnTypeFields || fn.returnTypeFields.length === 0) continue;
-            const retType = fn.returns?.[0]?.type ?? '';
-            const bare = extractBareType(retType);
-            if (bare) {
-                const existing = typeIndex.get(bare);
-                if (existing) {
-                    const existingNames = new Set(existing.map(f => f.name));
-                    for (const f of fn.returnTypeFields) {
-                        if (!existingNames.has(f.name)) {
-                            existing.push(f);
-                            indexVar(f);
-                        }
-                    }
-                } else {
-                    typeIndex.set(bare, [...fn.returnTypeFields]);
-                    for (const f of fn.returnTypeFields) indexVar(f);
-                }
-            }
-        }
+        const globalTypeIndex = graph.globalTypeIndex;
 
         return (typeStr: string) => {
             const bare = extractBareType(typeStr);
-            // Check locally-indexed fields first (built from vars + scope frames),
-            // then fall back to the global type registry from the Go analyzer.
-            return typeIndex.get(bare) ?? graph.typeRegistry.get(bare);
+            return typeIndex.get(bare) ??
+                globalTypeIndex?.get(bare) ??
+                graph.typeRegistry.get(bare);
         };
     }
 
@@ -1110,6 +1082,29 @@ export class ScopeUtils {
         elemType?: string;
         isSlice?: boolean;
     } | null {
+        const cacheKey = `${blockName}:${currentFilePath || ''}`;
+        if (this.namedBlockCallCtxCache.has(cacheKey)) {
+            return this.namedBlockCallCtxCache.get(cacheKey) ?? null;
+        }
+
+        const result = this._resolveNamedBlockCallCtxUncached(blockName, vars, currentFileNodes, currentFilePath);
+        this.namedBlockCallCtxCache.set(cacheKey, result);
+        return result;
+    }
+
+    private _resolveNamedBlockCallCtxUncached(
+        blockName: string,
+        vars: Map<string, TemplateVar>,
+        currentFileNodes: TemplateNode[],
+        currentFilePath?: string
+    ): {
+        typeStr: string;
+        fields?: FieldInfo[];
+        isMap?: boolean;
+        keyType?: string;
+        elemType?: string;
+        isSlice?: boolean;
+    } | null {
         const graph = this.graphBuilder.getGraph();
         const blockCtx = graph.templates.get(blockName);
         if (blockCtx) {
@@ -1136,7 +1131,6 @@ export class ScopeUtils {
 
         const localCtx = this.findCallSiteContext(currentFileNodes, blockName, currentFileVars, []);
 
-        // If local context was found, even if it has no fields (e.g. map/slice), return it if it has a valid typeStr.
         const localIsValid = localCtx && localCtx.typeStr && localCtx.typeStr !== 'unknown';
 
         if (localIsValid) {
@@ -1151,31 +1145,22 @@ export class ScopeUtils {
         for (const [, templateCtx] of graph.templates) {
             if (!templateCtx.absolutePath) continue;
             if (currentFilePath && templateCtx.absolutePath === currentFilePath) continue;
-            if (!fs.existsSync(templateCtx.absolutePath)) continue;
-            try {
-                const openDoc = vscode.workspace.textDocuments.find(
-                    d => d.uri.fsPath === templateCtx.absolutePath
-                );
-                const content = openDoc
-                    ? openDoc.getText()
-                    : fs.readFileSync(templateCtx.absolutePath, 'utf8');
-                const fileNodes = this.parser.parse(content);
-                const callCtx = this.findCallSiteContext(
-                    fileNodes, blockName, templateCtx.vars, []
-                );
-                if (callCtx && callCtx.typeStr && callCtx.typeStr !== 'unknown') {
-                    if ((!callCtx.fields || callCtx.fields.length === 0) && blockCtx) {
-                        const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
-                        if (synthFields.length > 0) {
-                            return { ...callCtx, fields: synthFields };
-                        }
+            const fileNodes = this.graphBuilder.getParsedNodes(templateCtx.absolutePath);
+            if (!fileNodes) continue;
+            const callCtx = this.findCallSiteContext(
+                fileNodes, blockName, templateCtx.vars, []
+            );
+            if (callCtx && callCtx.typeStr && callCtx.typeStr !== 'unknown') {
+                if ((!callCtx.fields || callCtx.fields.length === 0) && blockCtx) {
+                    const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];
+                    if (synthFields.length > 0) {
+                        return { ...callCtx, fields: synthFields };
                     }
-                    return callCtx;
                 }
-            } catch { /* ignore */ }
+                return callCtx;
+            }
         }
 
-        // No cross-file caller found — fall back to local context even if it's unknown
         if (localCtx) {
             if ((!localCtx.fields || localCtx.fields.length === 0) && blockCtx) {
                 const synthFields = [...blockCtx.vars.values()] as unknown as FieldInfo[];

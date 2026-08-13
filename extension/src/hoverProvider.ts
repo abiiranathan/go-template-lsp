@@ -1,9 +1,3 @@
-/**
- * Package hoverProvider implements the VS Code hover provider for golang templates.
- * It queries the Go analyzer daemon for rich Markdown tooltips with type,
- * documentation, method signatures, and field information.
- */
-
 import * as vscode from 'vscode';
 import {
     ExpressionTypeResult,
@@ -64,18 +58,14 @@ export class HoverProvider {
 
     /**
      * Returns hover information for the template element at position.
-     * Primary resolution is handled by the Go analyzer daemon for 100% accuracy.
+     * Evaluates instantly in memory from the TS AST, falling back to the Go analyzer daemon if unresolved.
      */
     async getHoverInfo(
         document: vscode.TextDocument,
         position: vscode.Position,
         ctx: TemplateContext
     ): Promise<vscode.Hover | null> {
-        // Primary path: Query Go daemon first (instant, 100% accurate Go types, methods & docs)
-        const goHover = await this.tryGoHoverFallback(document, position);
-        if (goHover) return goHover;
-
-        // Fallback path: Local TS AST inspection
+        // Fast path 1: Instant local TS AST inspection (< 1 ms)
         const content = document.getText();
         const nodes = this.parser.parse(content);
 
@@ -89,7 +79,55 @@ export class HoverProvider {
         const hit = this.scope.findNodeAtPosition(
             nodes, position, ctx.vars, [], nodes, undefined, ctx.absolutePath
         );
-        if (!hit) {
+
+        if (hit) {
+            const { node, stack, vars: hitVars, locals: hitLocals } = hit;
+
+            if (node.rawText) {
+                const cursorOffset = position.character - (node.col - 1);
+                const subPathStr = this.extractPathAtCursor(node.rawText, cursorOffset);
+
+                if (subPathStr) {
+                    // User-defined Functions
+                    const funcMaps = this.graphBuilder.getGraph().funcMaps;
+                    if (funcMaps && funcMaps.has(subPathStr)) {
+                        return this.buildFuncMapHover(funcMaps.get(subPathStr)!);
+                    }
+
+                    // Built-in Functions
+                    if (this.builtInFunctions.has(subPathStr)) {
+                        return this.buildFuncMapHover(this.builtInFunctions.get(subPathStr)!);
+                    }
+
+                    const parts = this.parser.parseDotPath(subPathStr);
+                    if (parts.length > 0 && !(parts.length === 1 && parts[0] === '.' && subPathStr !== '.')) {
+                        const subResult = resolvePath(
+                            parts, hitVars, stack, hitLocals,
+                            this.scope.buildFieldResolver(hitVars, stack)
+                        );
+                        if (subResult.found && subResult.typeStr !== 'unknown') {
+                            return this.buildHoverForPath(parts, subResult, hitVars, stack, hitLocals);
+                        }
+                    }
+                }
+            }
+
+            const isDotPath = node.path.length === 1 && node.path[0] === '.';
+            const isPartialDotCtx =
+                node.kind === 'partial' && (node.partialContext ?? '.') === '.';
+
+            if (isDotPath || isPartialDotCtx) {
+                return this.buildDotHover(stack, hitVars, this.scope.buildFieldResolver(hitVars, stack));
+            }
+
+            const result = resolvePath(
+                node.path, hitVars, stack, hitLocals,
+                this.scope.buildFieldResolver(hitVars, stack)
+            );
+            if (result.found && result.typeStr !== 'unknown') {
+                return this.buildHoverForPath(node.path, result, hitVars, stack, hitLocals, node.rawText);
+            }
+        } else {
             const enclosing = this.scope.findEnclosingBlockOrDefine(nodes, position);
             if (enclosing?.blockName) {
                 const callCtx = this.scope.resolveNamedBlockCallCtxForPosition(
@@ -117,55 +155,10 @@ export class HoverProvider {
                     return new vscode.Hover(md);
                 }
             }
-            return this.tryGoHoverFallback(document, position);
         }
 
-        const { node, stack, vars: hitVars, locals: hitLocals } = hit;
-
-        if (node.rawText) {
-            const cursorOffset = position.character - (node.col - 1);
-            const subPathStr = this.extractPathAtCursor(node.rawText, cursorOffset);
-
-            if (subPathStr) {
-                // User-defined Functions
-                const funcMaps = this.graphBuilder.getGraph().funcMaps;
-                if (funcMaps && funcMaps.has(subPathStr)) {
-                    return this.buildFuncMapHover(funcMaps.get(subPathStr)!);
-                }
-
-                // Built-in Functions
-                if (this.builtInFunctions.has(subPathStr)) {
-                    return this.buildFuncMapHover(this.builtInFunctions.get(subPathStr)!);
-                }
-
-                const parts = this.parser.parseDotPath(subPathStr);
-                if (parts.length > 0 && !(parts.length === 1 && parts[0] === '.' && subPathStr !== '.')) {
-                    const subResult = resolvePath(
-                        parts, hitVars, stack, hitLocals,
-                        this.scope.buildFieldResolver(hitVars, stack)
-                    );
-                    if (subResult.found) {
-                        return this.buildHoverForPath(parts, subResult, hitVars, stack, hitLocals);
-                    }
-                }
-            }
-        }
-
-        const isDotPath = node.path.length === 1 && node.path[0] === '.';
-        const isPartialDotCtx =
-            node.kind === 'partial' && (node.partialContext ?? '.') === '.';
-
-        if (isDotPath || isPartialDotCtx) {
-            return this.buildDotHover(stack, hitVars, this.scope.buildFieldResolver(hitVars, stack));
-        }
-
-        const result = resolvePath(
-            node.path, hitVars, stack, hitLocals,
-            this.scope.buildFieldResolver(hitVars, stack)
-        );
-        if (!result.found) return null;
-
-        return this.buildHoverForPath(node.path, result, hitVars, stack, hitLocals, node.rawText);
+        // Fallback path: Query Go daemon for complex expressions unresolved by local AST
+        return await this.tryGoHoverFallback(document, position);
     }
 
     private async tryGoHoverFallback(

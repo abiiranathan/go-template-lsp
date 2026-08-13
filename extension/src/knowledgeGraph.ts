@@ -31,6 +31,8 @@ export class KnowledgeGraphBuilder {
     };
 
     private astCache = new Map<string, TemplateNode[]>();
+    private absPathToContext = new Map<string, TemplateContext>();
+    private partialToParents = new Map<string, Set<string>>();
     private workspaceRoot: string;
     private outputChannel: vscode.OutputChannel;
     private readonly statusBarItem: vscode.StatusBarItem;
@@ -76,7 +78,7 @@ export class KnowledgeGraphBuilder {
         return path.join(baseDir, templateRoot);
     }
 
-    private getParsedNodes(absolutePath: string): TemplateNode[] | undefined {
+    getParsedNodes(absolutePath: string): TemplateNode[] | undefined {
         if (this.astCache.has(absolutePath)) {
             return this.astCache.get(absolutePath);
         }
@@ -108,6 +110,9 @@ export class KnowledgeGraphBuilder {
     build(analysisResult: AnalysisResult): KnowledgeGraph {
         this.partialContextCache.clear();
         this.astCache.clear();
+        this.absPathToContext.clear();
+        this.partialToParents.clear();
+        TemplateParser.clearCache();
 
         const templates = new Map<string, TemplateContext>();
         const templateBase = this.getTemplateBase();
@@ -158,9 +163,13 @@ export class KnowledgeGraphBuilder {
             }
         }
 
+        for (const ctx of templates.values()) {
+            if (ctx.absolutePath) {
+                this.absPathToContext.set(path.normalize(ctx.absolutePath).toLowerCase(), ctx);
+            }
+        }
+
         // ── Build named blocks registry directly from Go results ────────────────
-        // Optimization: Go's validator already parsed and registered all named blocks concurrently.
-        // We do NOT need to walk disk and regex-match files in Node.js again.
         const namedBlocks: NamedBlockRegistry = new Map();
         if (analysisResult.namedBlocks) {
             for (const [name, entries] of Object.entries(analysisResult.namedBlocks)) {
@@ -176,7 +185,90 @@ export class KnowledgeGraphBuilder {
             funcMaps.set(fm.name, fm);
         }
 
-        this.graph = { templates, namedBlocks, namedBlockErrors, analyzedAt: new Date(), funcMaps, typeRegistry };
+        // ── Pre-build global type index ─────────────────────────────────────────
+        const globalTypeIndex = new Map<string, FieldInfo[]>();
+        const indexVar = (v: TemplateVar | FieldInfo) => {
+            let bare = extractBareType(v.type);
+            let retFields: FieldInfo[] | undefined;
+
+            if (v.type === 'method' && (v as FieldInfo).returns?.length) {
+                bare = extractBareType((v as FieldInfo).returns![0].type);
+                retFields = (v as FieldInfo).returns![0].fields;
+            } else if (v.type.startsWith('func(')) {
+                const match = v.type.match(/func\([^)]*\)\s*(.+)/);
+                if (match && match[1]) {
+                    let retType = match[1].trim();
+                    if (retType.startsWith('(')) {
+                        const commaIdx = retType.indexOf(',');
+                        const endIdx = retType.indexOf(')');
+                        const cutIdx = commaIdx !== -1 ? commaIdx : endIdx;
+                        retType = retType.slice(1, cutIdx).trim();
+                    }
+                    bare = extractBareType(retType);
+                }
+            }
+
+            const fieldsToIndex = retFields || v.fields;
+            if (bare && bare !== 'method' && !bare.startsWith('func(') && fieldsToIndex && fieldsToIndex.length > 0) {
+                const existing = globalTypeIndex.get(bare);
+                if (existing) {
+                    const existingNames = new Set(existing.map(f => f.name));
+                    for (const f of fieldsToIndex) {
+                        if (!existingNames.has(f.name)) {
+                            existing.push(f);
+                            indexVar(f);
+                        }
+                    }
+                } else {
+                    globalTypeIndex.set(bare, [...fieldsToIndex]);
+                    for (const f of fieldsToIndex) indexVar(f);
+                }
+            } else if (fieldsToIndex && fieldsToIndex.length > 0) {
+                for (const f of fieldsToIndex) indexVar(f);
+            }
+        };
+
+        for (const [typeName, fields] of typeRegistry) {
+            if (fields && fields.length > 0) {
+                globalTypeIndex.set(typeName, fields);
+                for (const f of fields) indexVar(f);
+            }
+        }
+
+        for (const [, ctx] of templates) {
+            for (const v of ctx.vars.values()) indexVar(v);
+        }
+
+        for (const [, fn] of funcMaps) {
+            if (!fn.returnTypeFields || fn.returnTypeFields.length === 0) continue;
+            const retType = fn.returns?.[0]?.type ?? '';
+            const bare = extractBareType(retType);
+            if (bare) {
+                const existing = globalTypeIndex.get(bare);
+                if (existing) {
+                    const existingNames = new Set(existing.map(f => f.name));
+                    for (const f of fn.returnTypeFields) {
+                        if (!existingNames.has(f.name)) {
+                            existing.push(f);
+                            indexVar(f);
+                        }
+                    }
+                } else {
+                    globalTypeIndex.set(bare, [...fn.returnTypeFields]);
+                    for (const f of fn.returnTypeFields) indexVar(f);
+                }
+            }
+        }
+
+        // ── Pre-index partial calls ─────────────────────────────────────────────
+        for (const [, parentCtx] of templates) {
+            if (!parentCtx.absolutePath) continue;
+            const nodes = this.getParsedNodes(parentCtx.absolutePath);
+            if (!nodes) continue;
+            this.indexPartialCallsInNodes(nodes, parentCtx.absolutePath);
+        }
+
+        this.graph = { templates, namedBlocks, namedBlockErrors, analyzedAt: new Date(), funcMaps, typeRegistry, globalTypeIndex };
 
         this.outputChannel.appendLine(
             `[KnowledgeGraph] Built graph with ${templates.size} templates, ` +
@@ -186,6 +278,28 @@ export class KnowledgeGraphBuilder {
         );
 
         return this.graph;
+    }
+
+    private indexPartialCallsInNodes(nodes: TemplateNode[], parentAbsPath: string) {
+        for (const node of nodes) {
+            if (node.kind === 'partial' && node.partialName) {
+                let parentSet = this.partialToParents.get(node.partialName);
+                if (!parentSet) {
+                    parentSet = new Set<string>();
+                    this.partialToParents.set(node.partialName, parentSet);
+                }
+                parentSet.add(parentAbsPath);
+            } else if (node.kind === 'block' && node.blockName) {
+                let parentSet = this.partialToParents.get(node.blockName);
+                if (!parentSet) {
+                    parentSet = new Set<string>();
+                    this.partialToParents.set(node.blockName, parentSet);
+                }
+                parentSet.add(parentAbsPath);
+            }
+            if (node.children) this.indexPartialCallsInNodes(node.children, parentAbsPath);
+            if (node.elseChildren) this.indexPartialCallsInNodes(node.elseChildren, parentAbsPath);
+        }
     }
 
     private createNamedBlockEntry(base: any, name: string): NamedBlockEntry {
@@ -229,21 +343,15 @@ export class KnowledgeGraphBuilder {
     }
 
     findContextForFile(absolutePath: string): TemplateContext | undefined {
+        const norm = path.normalize(absolutePath).toLowerCase();
+        const hit = this.absPathToContext.get(norm);
+        if (hit) return hit;
+
         const templateBase = this.getTemplateBase();
         let rel = path.relative(templateBase, absolutePath).replace(/\\/g, '/');
 
         if (this.graph.templates.has(rel)) {
             return this.graph.templates.get(rel);
-        }
-
-        const normalizedAbsPath = path.normalize(absolutePath).toLowerCase();
-        for (const [tplPath, ctx] of this.graph.templates) {
-            if (ctx.absolutePath && path.normalize(ctx.absolutePath).toLowerCase() === normalizedAbsPath) {
-                return ctx;
-            }
-            if (rel.endsWith(tplPath) || tplPath.endsWith(rel)) {
-                return ctx;
-            }
         }
 
         const base = path.basename(absolutePath);
@@ -299,9 +407,33 @@ export class KnowledgeGraphBuilder {
             }
         }
 
-        const parentEntries = [...this.graph.templates.entries()].filter(
-            ([, ctx]) => ctx.absolutePath && fs.existsSync(ctx.absolutePath)
-        );
+        // Collect candidate parent absolute paths using partialToParents index
+        const candidateAbsPaths = new Set<string>();
+        const addCandidates = (key: string) => {
+            const parents = this.partialToParents.get(key);
+            if (parents) {
+                for (const p of parents) candidateAbsPaths.add(p);
+            }
+        };
+
+        addCandidates(partialRelPath);
+        addCandidates(partialBasename);
+        for (const blockName of definedBlocksInFile) {
+            addCandidates(blockName);
+        }
+
+        let parentEntries: Array<[string, TemplateContext]>;
+        if (candidateAbsPaths.size > 0) {
+            parentEntries = [];
+            for (const abs of candidateAbsPaths) {
+                const ctx = this.findContextForFile(abs);
+                if (ctx) parentEntries.push([ctx.templatePath, ctx]);
+            }
+        } else {
+            parentEntries = [...this.graph.templates.entries()].filter(
+                ([, ctx]) => ctx.absolutePath && fs.existsSync(ctx.absolutePath)
+            );
+        }
 
         let foundAny = false;
         const mergedVars = new Map<string, TemplateVar>();
@@ -434,7 +566,9 @@ export class KnowledgeGraphBuilder {
 
         return (t: string) => {
             const bare = extractBareType(t);
-            return typeIndex.get(bare) ?? this.graph.typeRegistry.get(bare);
+            return typeIndex.get(bare) ??
+                this.graph.globalTypeIndex?.get(bare) ??
+                this.graph.typeRegistry.get(bare);
         };
     }
 
@@ -478,6 +612,11 @@ export class KnowledgeGraphBuilder {
     updateTemplateFile(absolutePath: string, content: string) {
         this.invalidateAstCache(absolutePath);
         this.partialContextCache.clear();
+        this.absPathToContext.delete(path.normalize(absolutePath).toLowerCase());
+        const ctx = this.findContextForFile(absolutePath);
+        if (ctx && ctx.absolutePath) {
+            this.absPathToContext.set(path.normalize(ctx.absolutePath).toLowerCase(), ctx);
+        }
     }
 }
 

@@ -175,6 +175,8 @@ export interface KnowledgeGraph {
   /** Global type registry from the Go analyzer: bare type name → one-level fields.
    *  Use buildFieldResolver (which falls back here) to navigate nested type hierarchies. */
   typeRegistry: Map<string, FieldInfo[]>;
+  /** Pre-indexed global field resolver map for fast lookup across workspace */
+  globalTypeIndex?: Map<string, FieldInfo[]>;
 }
 
 /**

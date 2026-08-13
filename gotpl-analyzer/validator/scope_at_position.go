@@ -469,7 +469,31 @@ func extractSubPathAtCursor(action string, offset int) string {
 	if len(action) == 0 || offset < 0 || offset > len(action) {
 		return ""
 	}
-	// If cursor is exactly on a dot, no useful segment.
+
+	// 1. Check if cursor is inside a quoted string literal ("..." or `...`)
+	inQuote := false
+	var quoteByte byte
+	strStart := -1
+
+	for i := 0; i < len(action); i++ {
+		b := action[i]
+		if !inQuote && (b == '"' || b == '`') {
+			inQuote = true
+			quoteByte = b
+			strStart = i
+		} else if inQuote && b == quoteByte && (i == 0 || action[i-1] != '\\') {
+			inQuote = false
+			strEnd := i + 1
+			if offset >= strStart && offset <= strEnd {
+				return action[strStart:strEnd]
+			}
+		}
+	}
+	if inQuote && offset >= strStart {
+		return action[strStart:]
+	}
+
+	// 2. Standard identifier / dot-path extraction
 	if offset < len(action) && action[offset] == '.' {
 		return ""
 	}
@@ -481,13 +505,11 @@ func extractSubPathAtCursor(action string, offset int) string {
 		return b == '$' || b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 	}
 
-	// Walk backward through dots and identifiers.
 	pathStart := offset
 	for pathStart > 0 && isPathChar(action[pathStart-1]) {
 		pathStart--
 	}
 
-	// Walk forward through identifier chars only (stop at dot).
 	segEnd := offset
 	for segEnd < len(action) && isIdentChar(action[segEnd]) {
 		segEnd++
@@ -498,11 +520,10 @@ func extractSubPathAtCursor(action string, offset int) string {
 	}
 
 	sub := action[pathStart:segEnd]
-	// Reject bare "$" or "."
 	if sub == "." || sub == "$" {
 		return ""
 	}
-	// Must contain an actual identifier — reject if it's just dots/symbols.
+
 	hasIdent := false
 	for _, r := range sub {
 		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {

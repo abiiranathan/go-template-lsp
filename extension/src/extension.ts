@@ -66,7 +66,6 @@ export async function activate(context: vscode.ExtensionContext) {
         if (e.affectsConfiguration('gotpl')) {
           config.reload();
           if (config.enabled()) {
-            // Reload window to fully re-activate
             vscode.commands.executeCommand('workbench.action.reloadWindow');
           }
         }
@@ -81,16 +80,13 @@ export async function activate(context: vscode.ExtensionContext) {
     return;
   }
 
-  // Ensure the Go analyzer binary is installed via `go install`
   const analyzerExecutablePath = await AnalyzerInstaller.ensureInstalled(context, outputChannel);
   if (!analyzerExecutablePath) {
     outputChannel.appendLine('[GoTpl] Analyzer not installed. Extension disabled.');
-    return; // Exit early if user declined installation or it failed
+    return;
   }
   analyzer = new GoAnalyzer(analyzerExecutablePath, outputChannel);
 
-  // Pass the shared statusBarItem into the builder so it can show progress
-  // messages without creating a second item.
   graphBuilder = new KnowledgeGraphBuilder(workspaceRoot, outputChannel, statusBarItem);
   setKnowledgeGraphBuilder(graphBuilder);
   validator = new TemplateValidator(outputChannel, graphBuilder, analyzer);
@@ -117,74 +113,6 @@ export async function activate(context: vscode.ExtensionContext) {
           'No template index yet. Run "GoTpl: Rebuild Template Index" first.'
         );
       }
-    }),
-
-    vscode.commands.registerCommand('gotpl.goToRenderCall', async () => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor || !isTemplate(editor.document)) return;
-
-      if (!graphBuilder) {
-        vscode.window.showErrorMessage('Template index is not ready.');
-        return;
-      }
-
-      let ctx = graphBuilder.findContextForFile(editor.document.uri.fsPath);
-
-      // If no direct render calls, see if it's used as a partial (inherits calls from parent)
-      if (!ctx || ctx.renderCalls.length === 0) {
-        const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(editor.document.uri.fsPath);
-        if (partialCtx) ctx = partialCtx;
-      }
-
-      if (!ctx) {
-        vscode.window.showInformationMessage('No Go render calls found for this template.');
-        return;
-      }
-
-      // Filter out synthetic context file calls
-      const realCalls = ctx.renderCalls.filter(rc => rc.file !== 'context-file');
-
-      if (realCalls.length === 0) {
-        vscode.window.showInformationMessage('No Go render calls found for this template (only synthetic context).');
-        return;
-      }
-
-      const jumpTo = async (rc: any) => {
-        const absPath = graphBuilder!.resolveGoFilePath(rc.file);
-        if (!absPath) {
-          vscode.window.showErrorMessage(`Could not resolve Go file: ${rc.file}`);
-          return;
-        }
-        const goDoc = await vscode.workspace.openTextDocument(absPath);
-        const goEditor = await vscode.window.showTextDocument(goDoc);
-        const line = Math.max(0, rc.line - 1);
-        const col = Math.max(0, (rc.templateNameStartCol ?? 1) - 1);
-        const pos = new vscode.Position(line, col);
-
-        goEditor.selection = new vscode.Selection(pos, pos);
-        goEditor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
-      };
-
-      if (realCalls.length === 1) {
-        await jumpTo(realCalls[0]);
-      } else {
-        const items = realCalls.map(rc => ({
-          label: `$(go) ${rc.file}:${rc.line}`,
-          description: rc.vars && rc.vars.length > 0
-            ? `Context vars: ${rc.vars.map((v: any) => v.name).join(', ')}`
-            : 'No context vars',
-          rc: rc
-        }));
-
-        const selected = await vscode.window.showQuickPick(items, {
-          placeHolder: 'Select a Go render call to jump to',
-          matchOnDescription: true
-        });
-
-        if (selected) {
-          await jumpTo(selected.rc);
-        }
-      }
     })
   );
 
@@ -195,36 +123,14 @@ export async function activate(context: vscode.ExtensionContext) {
       async provideHover(document, position, token) {
         if (!validator || !graphBuilder) return;
 
-        // Resolve context (cheap — uses the in-memory cache on graphBuilder)
         let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
-        if (!ctx || ctx.renderCalls.length === 0) {
+        if (!ctx || ctx.vars.size === 0) {
           const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(document.uri.fsPath);
           if (partialCtx) ctx = partialCtx;
         }
         if (!ctx) return;
 
-        // Race the hover computation against:
-        //   • the VS Code cancellation token (user moved cursor away), and
-        //   • a hard 1 s wall-clock timeout (prevents the "Loading…" spinner
-        //     from sticking when file I/O inside the hover provider is slow).
-        const hoverPromise = validator.getHoverInfo(document, position, ctx).catch(() => undefined);
-
-        const abortPromise = new Promise<undefined>(resolve => {
-          const cancelDisposable = token.onCancellationRequested(() => {
-            cancelDisposable.dispose();
-            resolve(undefined);
-          });
-          const tid = setTimeout(() => {
-            cancelDisposable.dispose();
-            resolve(undefined);
-          }, 1000);
-          hoverPromise.finally(() => {
-            clearTimeout(tid);
-            cancelDisposable.dispose();
-          });
-        });
-
-        return Promise.race([hoverPromise, abortPromise]);
+        return validator.getHoverInfo(document, position, ctx);
       },
     })
   );
@@ -236,7 +142,7 @@ export async function activate(context: vscode.ExtensionContext) {
         async provideCompletionItems(document, position) {
           if (!validator || !graphBuilder) return;
           let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
-          if (!ctx || ctx.renderCalls.length === 0) {
+          if (!ctx || ctx.vars.size === 0) {
             const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(document.uri.fsPath);
             if (partialCtx) ctx = partialCtx;
           }
@@ -253,7 +159,7 @@ export async function activate(context: vscode.ExtensionContext) {
       async provideDefinition(document, position) {
         if (!validator || !graphBuilder) return;
         let ctx = graphBuilder.findContextForFile(document.uri.fsPath);
-        if (!ctx || ctx.renderCalls.length === 0) {
+        if (!ctx || ctx.vars.size === 0) {
           const partialCtx = await graphBuilder.findContextForFileAsPartialAsync(document.uri.fsPath);
           if (partialCtx) ctx = partialCtx;
         }
@@ -354,29 +260,9 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  context.subscriptions.push(
-    vscode.languages.registerReferenceProvider(TEMPLATE_SELECTOR, {
-      async provideReferences(document, position, refCtx) {
-        if (!validator) return [];
-        const locs = await validator.getReferences(
-          document,
-          position,
-          refCtx.includeDeclaration
-        );
-        return locs ?? [];
-      },
-    })
-  );
-
-  // ── Initial build (non-blocking) ────────────────────────────────────────────
-
-  // Start initial analysis asynchronously so the extension activates immediately.
-  // LSP providers will return empty results until the first build completes.
   void rebuildIndex(workspaceRoot, 'full');
-  outputChannel.appendLine('[GoTpl] Ready (initial analysis in progress)');
+  outputChannel.appendLine('[GoTpl] Ready');
 }
-
-// ── Template detection ─────────────────────────────────────────────────────────
 
 function isTemplate(doc: vscode.TextDocument): boolean {
   return (
@@ -384,8 +270,6 @@ function isTemplate(doc: vscode.TextDocument): boolean {
     (doc.fileName.endsWith('.html') || doc.fileName.endsWith('.tmpl'))
   );
 }
-
-// ── Rebuild (full Go analysis) ─────────────────────────────────────────────────
 
 async function rebuildIndex(workspaceRoot: string, mode: 'full' | 'templates-only' = 'full') {
   if (!analyzer || !graphBuilder) return;
@@ -405,64 +289,14 @@ async function rebuildIndex(workspaceRoot: string, mode: 'full' | 'templates-onl
       : await analyzer.analyzeWorkspace(workspaceRoot);
     currentGraph = graphBuilder.build(result);
 
-    if (result.errors?.length) {
-      outputChannel.appendLine('[GoTpl] Analysis warnings:');
-      result.errors.slice(0, 10).forEach(e => outputChannel.appendLine(`  ${e}`));
-    }
-
-    const count = currentGraph.templates.size;
-    if (count === 0) {
-      outputChannel.appendLine('[GoTpl] No templates found.');
-      if (!result.renderCalls.length) {
-        outputChannel.appendLine('[GoTpl] No render calls found. Check your Go code calls c.Render().');
-      }
-    }
-
     const elapsed = Date.now() - startTime;
     outputChannel.appendLine(`[GoTpl] ${mode === 'templates-only' ? 'Template reanalysis' : 'Full analysis'} completed in ${elapsed}ms`);
 
-    // Apply diagnostics from Go analyzer
-    const initialValidationErrors = result.validationErrors ?? [];
-    const extensionMissingTemplateLogicalPaths = new Set<string>();
-    const extensionGeneratedErrors: GoValidationError[] = [];
-
-    for (const [logicalPath, ctx] of currentGraph.templates) {
-      const isNamedBlock = currentGraph.namedBlocks.has(logicalPath);
-      if (!fs.existsSync(ctx.absolutePath) && !isNamedBlock) {
-        for (const rc of ctx.renderCalls) {
-          extensionGeneratedErrors.push({
-            template: logicalPath,
-            line: rc.line,
-            column: rc.templateNameStartCol,
-            variable: logicalPath,
-            message: `Template file not found: ${logicalPath}`,
-            severity: 'error',
-            goFile: rc.file,
-            goLine: rc.line,
-            templateNameStartCol: rc.templateNameStartCol,
-            templateNameEndCol: rc.templateNameEndCol,
-          });
-          extensionMissingTemplateLogicalPaths.add(logicalPath);
-        }
-      }
-    }
-
-    const finalValidationErrors: GoValidationError[] = [];
-    for (const analyzerErr of initialValidationErrors) {
-      const isNotFoundMsg = analyzerErr.message.includes('Could not read template file:') ||
-        analyzerErr.message.includes('Template or named block not found');
-      if (isNotFoundMsg && extensionMissingTemplateLogicalPaths.has(analyzerErr.template)) {
-        continue;
-      }
-      finalValidationErrors.push(analyzerErr);
-    }
-    finalValidationErrors.push(...extensionGeneratedErrors);
-
-    await applyAnalyzerDiagnostics(finalValidationErrors, workspaceRoot, sourceDir, templateRoot, templateBaseDir);
+    await applyAnalyzerDiagnostics(result.validationErrors ?? [], workspaceRoot, sourceDir, templateRoot, templateBaseDir);
     applyNamedBlockDiagnostics();
-
     await validateOpenTemplateDocuments();
 
+    const count = currentGraph.templates.size;
     statusBarItem.text = `$(check) GoTpl: ${count} template${count === 1 ? '' : 's'} indexed`;
     statusBarItem.show();
     setTimeout(() => statusBarItem.hide(), 5000);
@@ -504,19 +338,6 @@ function applyNamedBlockDiagnostics() {
       diag.source = 'GoTpl';
       diag.code = 'duplicate-named-block';
 
-      diag.relatedInformation = err.entries
-        .filter(e => e !== entry)
-        .map(
-          e =>
-            new vscode.DiagnosticRelatedInformation(
-              new vscode.Location(
-                vscode.Uri.file(e.absolutePath),
-                new vscode.Position(Math.max(0, e.line - 1), Math.max(0, e.col - 1))
-              ),
-              `Also declared here as "${e.name}"`
-            )
-        );
-
       const list = issuesByFile.get(entry.absolutePath) ?? [];
       list.push(diag);
       issuesByFile.set(entry.absolutePath, list);
@@ -526,10 +347,6 @@ function applyNamedBlockDiagnostics() {
   for (const [filePath, issues] of issuesByFile) {
     namedBlockCollection.set(vscode.Uri.file(filePath), issues);
   }
-
-  outputChannel.appendLine(
-    `[GoTpl] Applied ${duplicateErrors.length} duplicate named-block diagnostic(s)`
-  );
 }
 
 async function applyAnalyzerDiagnostics(
@@ -540,126 +357,66 @@ async function applyAnalyzerDiagnostics(
   templateBaseDir: string
 ) {
   analyzerCollection.clear();
-  const contextFile: string = config.contextFile();
   const issuesByFile = new Map<string, vscode.Diagnostic[]>();
-  const showCallSite = config.showCallSiteErrors();
-
-  // When showCallSiteErrors is off, deduplicate source-location errors that
-  // originate from the same bug but appear once per call site.
-  const seenSourceErrors = new Set<string>();
 
   for (const err of validationErrors) {
-    // If this error was relocated from a partial and we're suppressing call-site
-    // duplicates, only emit the source-location diagnostic once.
-    if (err.sourceTemplate && !showCallSite) {
-      const dedupeKey = `${err.sourceTemplate}:${err.sourceLine}:${err.sourceColumn}:${err.variable}`;
-      if (seenSourceErrors.has(dedupeKey)) continue;
-      seenSourceErrors.add(dedupeKey);
-    }
     let diagnosticFilePath: string;
     let diagnosticLine: number;
     let diagnosticCol: number;
     let diagnosticEndCol: number;
     let relatedInfo: vscode.DiagnosticRelatedInformation[] | undefined;
 
-    const isNotFound = err.message.includes('not found') || err.message.includes('Could not read template file');
+    const baseDir = templateBaseDir
+      ? path.join(workspaceRoot, templateBaseDir)
+      : path.join(workspaceRoot, sourceDir);
 
-    if (err.goFile === "context-file") {
-      if (isNotFound) {
-        diagnosticFilePath = contextFile ? path.resolve(workspaceRoot, contextFile) : path.join(workspaceRoot, sourceDir, err.goFile);
-        diagnosticLine = 0;
-        diagnosticCol = 0;
-        diagnosticEndCol = 100;
-      } else {
-        const baseDir = templateBaseDir ? path.resolve(workspaceRoot, templateBaseDir) : path.resolve(workspaceRoot, sourceDir);
-        diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
-        diagnosticLine = Math.max(0, err.line - 1);
-        diagnosticCol = Math.max(0, err.column - 1);
-        diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
+    // Handles relocated error originating inside a partial or block template
+    if (err.sourceTemplate && err.sourceLine) {
+      diagnosticFilePath = path.join(baseDir, templateRoot, err.sourceTemplate);
+      diagnosticLine = Math.max(0, err.sourceLine - 1);
+      diagnosticCol = Math.max(0, (err.sourceColumn ?? 1) - 1);
+      diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
 
-        if (contextFile) {
-          relatedInfo = [
-            new vscode.DiagnosticRelatedInformation(
-              new vscode.Location(
-                vscode.Uri.file(path.resolve(workspaceRoot, contextFile)),
-                new vscode.Position(0, 0)
-              ),
-              'Context provided by context-file'
-            )
-          ];
-        }
+      const callSitePath = path.join(baseDir, templateRoot, err.template);
+      relatedInfo = [
+        new vscode.DiagnosticRelatedInformation(
+          new vscode.Location(
+            vscode.Uri.file(callSitePath),
+            new vscode.Position(Math.max(0, err.line - 1), Math.max(0, err.column - 1))
+          ),
+          `Referenced from call-site in ${err.template}`
+        ),
+      ];
+
+      if (err.goFile) {
+        const goFileAbs = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
+        relatedInfo.push(
+          new vscode.DiagnosticRelatedInformation(
+            new vscode.Location(
+              vscode.Uri.file(goFileAbs),
+              new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
+            ),
+            'Variable passed from Go render call'
+          )
+        );
       }
-    } else if (isNotFound && err.goFile && err.goLine !== undefined) {
-      diagnosticFilePath = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
-      diagnosticLine = Math.max(0, err.goLine - 1);
-      diagnosticCol = Math.max(0, (err.templateNameStartCol ?? 1) - 1);
-      diagnosticEndCol = Math.max(
-        0,
-        (err.templateNameEndCol ?? (err.templateNameStartCol ?? 1) + err.template.length) - 1
-      );
-      relatedInfo = undefined;
     } else {
-      const baseDir = templateBaseDir
-        ? path.join(workspaceRoot, templateBaseDir)
-        : path.join(workspaceRoot, sourceDir);
+      diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
+      diagnosticLine = Math.max(0, err.line - 1);
+      diagnosticCol = Math.max(0, err.column - 1);
+      diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
 
-      // When sourceTemplate is set, the error originates inside a named block
-      // or partial but has been relocated to the call site. Place the primary
-      // diagnostic at the actual source location so "Go to Problem" jumps to
-      // the real bug, and add the call site as related information.
-      if (err.sourceTemplate && err.sourceLine) {
-        const sourceFilePath = path.join(baseDir, templateRoot, err.sourceTemplate);
-        const sourceLine = Math.max(0, err.sourceLine - 1);
-        const sourceCol = Math.max(0, (err.sourceColumn ?? 1) - 1);
-        const sourceEndCol = sourceCol + (err.variable?.length || 1);
-
-        diagnosticFilePath = sourceFilePath;
-        diagnosticLine = sourceLine;
-        diagnosticCol = sourceCol;
-        diagnosticEndCol = sourceEndCol;
-
-        // The call site (where the {{ template }} invocation lives) as related info
-        const callSitePath = path.join(baseDir, templateRoot, err.template);
+      if (err.goFile) {
+        const goFileAbs = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
         relatedInfo = [
           new vscode.DiagnosticRelatedInformation(
             new vscode.Location(
-              vscode.Uri.file(callSitePath),
-              new vscode.Position(Math.max(0, err.line - 1), Math.max(0, err.column - 1))
+              vscode.Uri.file(goFileAbs),
+              new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
             ),
-            `Referenced from ${err.template}`
+            'Variable passed from Go render call'
           ),
         ];
-
-        if (err.goFile) {
-          const goFileAbs = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
-          relatedInfo.push(
-            new vscode.DiagnosticRelatedInformation(
-              new vscode.Location(
-                vscode.Uri.file(goFileAbs),
-                new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
-              ),
-              'Variable passed from here'
-            )
-          );
-        }
-      } else {
-        diagnosticFilePath = path.join(baseDir, templateRoot, err.template);
-        diagnosticLine = Math.max(0, err.line - 1);
-        diagnosticCol = Math.max(0, err.column - 1);
-        diagnosticEndCol = diagnosticCol + (err.variable?.length || 1);
-
-        if (err.goFile) {
-          const goFileAbs = path.join(path.resolve(workspaceRoot, sourceDir), err.goFile);
-          relatedInfo = [
-            new vscode.DiagnosticRelatedInformation(
-              new vscode.Location(
-                vscode.Uri.file(goFileAbs),
-                new vscode.Position(Math.max(0, (err.goLine ?? 1) - 1), 0)
-              ),
-              'Variable passed from here'
-            ),
-          ];
-        }
       }
     }
 
@@ -682,11 +439,7 @@ async function applyAnalyzerDiagnostics(
   for (const [filePath, issues] of issuesByFile) {
     analyzerCollection.set(vscode.Uri.file(filePath), issues);
   }
-
-  outputChannel.appendLine(`[GoTpl] Applied ${validationErrors.length} analyzer diagnostics`);
 }
-
-// ── Per-document validation ────────────────────────────────────────────────────
 
 async function validateDocument(doc: vscode.TextDocument, requestedVersion = doc.version) {
   if (!analyzer) return;
@@ -710,10 +463,6 @@ async function validateDocument(doc: vscode.TextDocument, requestedVersion = doc
     }
 
     const errors = result.validationErrors ?? [];
-
-    outputChannel.appendLine(
-      `[GoTpl] Live validation ${doc.uri.fsPath}: hasContext=${result.hasContext} errors=${errors.length}`
-    );
     if (!result.hasContext) {
       editorCollection.delete(doc.uri);
       return;
@@ -724,7 +473,6 @@ async function validateDocument(doc: vscode.TextDocument, requestedVersion = doc
     outputChannel.appendLine(`[GoTpl] Live validation failed for ${doc.uri.fsPath}: ${err}`);
   }
 }
-
 
 function scheduleRebuild(workspaceRoot: string, mode: 'full' | 'templates-only' = 'full') {
   const debounceMs = config.debounceMs();
@@ -743,11 +491,8 @@ function scheduleValidateDocument(doc: vscode.TextDocument) {
   const scheduledVersion = doc.version;
   const timer = setTimeout(async () => {
     validateTimers.delete(docKey);
-
     const currentDoc = vscode.workspace.textDocuments.find(openDoc => openDoc.uri.toString() === docKey);
-    if (!currentDoc || !isTemplate(currentDoc)) {
-      return;
-    }
+    if (!currentDoc || !isTemplate(currentDoc)) return;
 
     await validateDocument(currentDoc, scheduledVersion);
   }, debounceMs);
@@ -768,9 +513,7 @@ function scheduleValidateOpenTemplateDocuments(excludeDocKey?: string) {
 async function validateOpenTemplateDocuments(excludeDocKey?: string) {
   const openDocs = vscode.workspace.textDocuments.filter(isTemplate);
   for (const doc of openDocs) {
-    if (excludeDocKey && doc.uri.toString() === excludeDocKey) {
-      continue;
-    }
+    if (excludeDocKey && doc.uri.toString() === excludeDocKey) continue;
     await validateDocument(doc);
   }
 }
@@ -778,16 +521,10 @@ async function validateOpenTemplateDocuments(excludeDocKey?: string) {
 function diagnosticsFromValidationErrors(errors: GoValidationError[]): vscode.Diagnostic[] {
   if (!errors) return [];
 
-  // When showCallSiteErrors is off, drop errors that were relocated from a
-  // named block/partial to the call site — the source-location diagnostic
-  // (from the full rebuild) already covers them.
-  const filtered = config.showCallSiteErrors()
-    ? errors
-    : errors.filter(err => !err.sourceTemplate);
-
-  return filtered.map(err => {
-    const line = Math.max(0, err.line - 1);
-    const col = Math.max(0, err.column - 1);
+  return errors.map(err => {
+    // Correctly locate error on sourceTemplate line if relocated from a partial
+    const line = Math.max(0, (err.sourceLine ?? err.line) - 1);
+    const col = Math.max(0, (err.sourceColumn ?? err.column) - 1);
     const range = new vscode.Range(line, col, line, col + (err.variable?.length || 1));
     const diagnostic = new vscode.Diagnostic(
       range,
@@ -798,8 +535,6 @@ function diagnosticsFromValidationErrors(errors: GoValidationError[]): vscode.Di
     return diagnostic;
   });
 }
-
-// ── Deactivation ───────────────────────────────────────────────────────────────
 
 export function deactivate() {
   if (rebuildTimer) clearTimeout(rebuildTimer);

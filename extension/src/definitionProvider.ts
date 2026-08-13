@@ -1,6 +1,6 @@
 /**
  * Package definitionProvider implements the VS Code go-to-definition provider
- * for templates.  It resolves template variables, fields, funcMap functions,
+ * for templates. It resolves template variables, fields, funcMap functions,
  * partial templates, and named blocks to their declaration sites in Go source files
  * or template files.
  */
@@ -105,17 +105,23 @@ export class DefinitionProvider {
                 targetPath, hitVars, stack, hitLocals,
                 this.scope.buildFieldResolver(hitVars, stack)
             );
-            if (subResult.found && subResult.defFile && subResult.defLine) {
-                const abs = this.resolveGoFile(subResult.defFile);
-                if (abs) {
-                    return new vscode.Location(
-                        vscode.Uri.file(abs),
-                        new vscode.Position(
-                            Math.max(0, subResult.defLine - 1),
-                            (subResult.defCol ?? 1) - 1
-                        )
-                    );
+
+            if (subResult.found) {
+                if (subResult.defFile && subResult.defLine) {
+                    const abs = this.resolveGoFile(subResult.defFile);
+                    if (abs) {
+                        return new vscode.Location(
+                            vscode.Uri.file(abs),
+                            new vscode.Position(
+                                Math.max(0, subResult.defLine - 1),
+                                (subResult.defCol ?? 1) - 1
+                            )
+                        );
+                    }
                 }
+                // Path resolved successfully to a valid field or method, but has no defFile
+                // (e.g. stdlib methods like .Format). Do NOT fall through to the RenderCall fallback!
+                return null;
             }
         }
 
@@ -145,7 +151,6 @@ export class DefinitionProvider {
         }
 
         const stackDefLoc = this.findDefinitionInScope(pathForDef, hitVars, stack, ctx);
-
         if (stackDefLoc) return stackDefLoc;
 
         for (const rc of ctx.renderCalls) {
@@ -190,9 +195,7 @@ export class DefinitionProvider {
 
     /**
      * Returns the definition location when the cursor is on a Render() template
-     * path string inside a Go source file.  Handles both string literals and
-     * variable-based template names by falling back to the knowledge graph's
-     * render call index.
+     * path string inside a Go source file.
      */
     getTemplateDefinitionFromGo(
         document: vscode.TextDocument,
@@ -200,8 +203,6 @@ export class DefinitionProvider {
     ): vscode.Location | null {
         const line = document.lineAt(position.line).text;
 
-        // 1. Try matching string literals: .Render("template.html", ...) or
-        //    ExecuteTemplate(w, "template.html", ...)
         const renderRegex = /(?:\.Render|ExecuteTemplate)\s*\([^"]*"([^"]+)"/g;
         let match: RegExpExecArray | null;
         while ((match = renderRegex.exec(line)) !== null) {
@@ -220,11 +221,9 @@ export class DefinitionProvider {
             }
         }
 
-        // 2. Fall back to the knowledge graph: if the cursor is on a line that
-        //    has a known render call (even via a variable), resolve the template.
         const relGoFile = this.graphBuilder.getRelativeGoFile(document.uri.fsPath);
         if (relGoFile) {
-            const goLine1 = position.line + 1; // render calls use 1-based lines
+            const goLine1 = position.line + 1;
             for (const [, ctx] of this.graphBuilder.getGraph().templates) {
                 for (const rc of ctx.renderCalls) {
                     if (rc.file === relGoFile && rc.line === goLine1) {

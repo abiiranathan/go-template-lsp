@@ -425,11 +425,36 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 		params.TemplateRoot,
 	)
 
-	// Build the render-var index BEFORE Flatten() so field trees are intact.
-	renderVarIndex := buildRenderVarIndex(result.RenderCalls)
+	store := validator.LoadTemplateStore(baseDir, params.TemplateRoot)
+	funcMapReg := validator.BuildFuncMapRegistry(result.FuncMaps)
 
-	// Clone the result before flattening so we can reuse the un-flattened
-	// version for future incremental re-validation.
+	// Build render-var index with full partial & named-block variable propagation
+	renderVarIndex := validator.BuildPropagatedRenderVarIndex(
+		result.RenderCalls, namedBlocks, baseDir, params.TemplateRoot, funcMapReg, store,
+	)
+
+	// Propagate variables into result.RenderCalls so clients (VS Code Extension,
+	// KnowledgeGraph) receive full variable context for every partial and named block.
+	existingCalls := make(map[string]bool, len(result.RenderCalls))
+	for i := range result.RenderCalls {
+		rc := &result.RenderCalls[i]
+		existingCalls[rc.Template] = true
+		if propagated, ok := renderVarIndex[rc.Template]; ok && len(propagated) > 0 {
+			rc.Vars = mergeVarSlices(rc.Vars, propagated)
+		}
+	}
+
+	for tplName, vars := range renderVarIndex {
+		if !existingCalls[tplName] && len(vars) > 0 {
+			result.RenderCalls = append(result.RenderCalls, ast.RenderCall{
+				File:     "template-call",
+				Line:     1,
+				Template: tplName,
+				Vars:     vars,
+			})
+		}
+	}
+
 	savedResult := cloneAnalysisResult(result)
 
 	result.Flatten()
@@ -447,7 +472,6 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 		output.NamedBlocks = namedBlocks
 	}
 
-	// Build immutable snapshot — no cloning needed by readers.
 	snap := &daemonState{
 		dir:                  params.Dir,
 		baseDir:              baseDir,
@@ -456,7 +480,7 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 		validate:             params.Validate,
 		output:               output,
 		renderVarsByTemplate: renderVarIndex,
-		funcMaps:             validator.BuildFuncMapRegistry(result.FuncMaps),
+		funcMaps:             funcMapReg,
 		typeRegistry:         result.Types,
 		namedBlocks:          namedBlocks,
 		partialTargets:       validator.FindPartialTargets(baseDir, params.TemplateRoot),
@@ -465,10 +489,8 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 		analysisResult:       savedResult,
 	}
 
-	// Atomic swap: readers instantly see the new state without waiting.
 	d.state.Store(snap)
 
-	// Preserve existing overlays (don't reset on re-analyze).
 	if d.templateOverlays == nil {
 		d.overlayMu.Lock()
 		d.templateOverlays = make(map[string]string)
@@ -476,6 +498,47 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 	}
 
 	return output, nil
+}
+
+func mergeVarSlices(a, b []ast.TemplateVar) []ast.TemplateVar {
+	seen := make(map[string]bool, len(a)+len(b))
+	res := make([]ast.TemplateVar, 0, len(a)+len(b))
+	for _, v := range a {
+		if !seen[v.Name] {
+			seen[v.Name] = true
+			res = append(res, v)
+		}
+	}
+	for _, v := range b {
+		if !seen[v.Name] {
+			seen[v.Name] = true
+			res = append(res, v)
+		}
+	}
+	return res
+}
+
+func findRenderVarsForTemplateWithRegistry(
+	renderVarsByTemplate map[string][]ast.TemplateVar,
+	absPath, baseDir, templateRoot string,
+	registry map[string][]validator.NamedBlockEntry,
+) (string, []ast.TemplateVar, bool) {
+	if key, vars, ok := findRenderVarsForTemplate(renderVarsByTemplate, absPath, baseDir, templateRoot); ok {
+		return key, vars, true
+	}
+
+	normalizedAbs := normalizePath(absPath)
+	for blockName, entries := range registry {
+		for _, entry := range entries {
+			if normalizePath(entry.AbsolutePath) == normalizedAbs {
+				if vars, ok := renderVarsByTemplate[blockName]; ok && len(vars) > 0 {
+					return blockName, vars, true
+				}
+			}
+		}
+	}
+
+	return "", nil, false
 }
 
 // reanalyzeTemplates re-runs only the template validation step using the
@@ -756,7 +819,7 @@ func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validat
 		applyTemplateOverlays(registry, overlays, snap.baseDir, snap.templateRoot)
 	}
 
-	_, vars, ok := findRenderVarsForTemplate(snap.renderVarsByTemplate, absPath, snap.baseDir, snap.templateRoot)
+	_, vars, ok := findRenderVarsForTemplateWithRegistry(snap.renderVarsByTemplate, absPath, snap.baseDir, snap.templateRoot, registry)
 	if !ok {
 		return nil, nil
 	}
@@ -814,29 +877,6 @@ func findRenderVarsForTemplate(
 	}
 
 	return "", nil, false
-}
-
-// buildRenderVarIndex creates a template-name → merged TemplateVar list from
-// all render calls. When multiple render calls target the same template, their
-// variable sets are unioned so downstream validation sees the broadest context.
-func buildRenderVarIndex(renderCalls []ast.RenderCall) map[string][]ast.TemplateVar {
-	idx := make(map[string][]ast.TemplateVar, len(renderCalls))
-	seen := make(map[string]map[string]bool, len(renderCalls))
-
-	for _, rc := range renderCalls {
-		if _, ok := idx[rc.Template]; !ok {
-			idx[rc.Template] = nil
-			seen[rc.Template] = make(map[string]bool)
-		}
-		for _, v := range rc.Vars {
-			if !seen[rc.Template][v.Name] {
-				seen[rc.Template][v.Name] = true
-				idx[rc.Template] = append(idx[rc.Template], v)
-			}
-		}
-	}
-
-	return idx
 }
 
 // cloneRegistry creates a shallow copy of the named block registry so that

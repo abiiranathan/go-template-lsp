@@ -39,7 +39,7 @@ type Visit struct {
 	PatientID uint
 	Patient   Patient
 	Doctor    Doctor
-	CreatedAt time.Time
+	CreatedAt time.Time // CreatedAt timestamp.
 }
 
 // Patient represents a patient

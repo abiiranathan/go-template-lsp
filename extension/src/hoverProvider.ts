@@ -1,7 +1,7 @@
 /**
  * Package hoverProvider implements the VS Code hover provider for golang templates.
- * It resolves the template variable or function under the cursor and returns a
- * rich Markdown tooltip with type, documentation, and field information.
+ * It queries the Go analyzer daemon for rich Markdown tooltips with type,
+ * documentation, method signatures, and field information.
  */
 
 import * as vscode from 'vscode';
@@ -20,10 +20,6 @@ import { inferExpressionType, TypeResult } from './compiler/expressionParser';
 import { ScopeUtils } from './scopeUtils';
 import { GoAnalyzer } from './analyzer';
 
-/**
- * HoverProvider resolves hover information for template variables, fields,
- * and funcMap functions.
- */
 export class HoverProvider {
     private readonly parser: TemplateParser;
     private readonly graphBuilder: KnowledgeGraphBuilder;
@@ -66,17 +62,20 @@ export class HoverProvider {
         this.analyzer = analyzer;
     }
 
-    // ── Public API ─────────────────────────────────────────────────────────────
-
     /**
-     * Returns hover information for the template element at position, or null
-     * when nothing actionable is under the cursor.
+     * Returns hover information for the template element at position.
+     * Primary resolution is handled by the Go analyzer daemon for 100% accuracy.
      */
     async getHoverInfo(
         document: vscode.TextDocument,
         position: vscode.Position,
         ctx: TemplateContext
     ): Promise<vscode.Hover | null> {
+        // Primary path: Query Go daemon first (instant, 100% accurate Go types, methods & docs)
+        const goHover = await this.tryGoHoverFallback(document, position);
+        if (goHover) return goHover;
+
+        // Fallback path: Local TS AST inspection
         const content = document.getText();
         const nodes = this.parser.parse(content);
 
@@ -140,22 +139,13 @@ export class HoverProvider {
                 }
 
                 const parts = this.parser.parseDotPath(subPathStr);
-                if (
-                    parts.length > 0 &&
-                    !(parts.length === 1 && parts[0] === '.' && subPathStr !== '.')
-                ) {
+                if (parts.length > 0 && !(parts.length === 1 && parts[0] === '.' && subPathStr !== '.')) {
                     const subResult = resolvePath(
                         parts, hitVars, stack, hitLocals,
                         this.scope.buildFieldResolver(hitVars, stack)
                     );
                     if (subResult.found) {
-                        if (!subResult.typeStr || subResult.typeStr === 'unknown') {
-                            const goHover = await this.tryGoHoverFallback(document, position);
-                            if (goHover) return goHover;
-                        }
-                        return this.buildHoverForPath(
-                            parts, subResult, hitVars, stack, hitLocals
-                        );
+                        return this.buildHoverForPath(parts, subResult, hitVars, stack, hitLocals);
                     }
                 }
             }
@@ -169,88 +159,15 @@ export class HoverProvider {
             return this.buildDotHover(stack, hitVars, this.scope.buildFieldResolver(hitVars, stack));
         }
 
-        let result = resolvePath(
+        const result = resolvePath(
             node.path, hitVars, stack, hitLocals,
             this.scope.buildFieldResolver(hitVars, stack)
         );
-        let isExpressionFallback = false;
-        let exprText = node.rawText;
+        if (!result.found) return null;
 
-        if (!result.found && node.rawText) {
-            try {
-                const cleanExpr = node.rawText
-                    .replace(/^\{\{-?\s*/, '')
-                    .replace(/\s*-?\}\}$/, '');
-                const exprType = await this.inferExpressionType(document, cleanExpr, hitVars, stack, hitLocals);
-
-                if (exprType) {
-                    result = {
-                        typeStr: exprType.typeStr,
-                        found: true,
-                        fields: exprType.fields,
-                        isSlice: exprType.isSlice,
-                        isMap: exprType.isMap,
-                        elemType: exprType.elemType,
-                        keyType: exprType.keyType,
-                    };
-                    isExpressionFallback = true;
-                    exprText = cleanExpr;
-                }
-            } catch { }
-        }
-
-        if (!result.found) return this.tryGoHoverFallback(document, position);
-
-        if (!result.typeStr || result.typeStr === 'unknown') {
-            const goHover = await this.tryGoHoverFallback(document, position);
-            if (goHover) return goHover;
-        }
-
-        const pathToUse = isExpressionFallback ? ['expression'] : node.path;
-        return this.buildHoverForPath(
-            pathToUse, result, hitVars, stack, hitLocals, exprText
-        );
+        return this.buildHoverForPath(node.path, result, hitVars, stack, hitLocals, node.rawText);
     }
 
-    private async inferExpressionType(
-        document: vscode.TextDocument,
-        expr: string,
-        vars: Map<string, TemplateVar>,
-        stack: ScopeFrame[],
-        locals?: Map<string, TemplateVar>,
-    ): Promise<ExpressionTypeResult | TypeResult | null> {
-        const workspaceRoot = vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath
-            ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-
-        if (workspaceRoot) {
-            try {
-                const result = await this.analyzer.inferExpressionType(workspaceRoot, expr, vars, stack, locals);
-                if (result) return result;
-            } catch {
-                // Fall back to the local inferencer below.
-            }
-        }
-
-        try {
-            return inferExpressionType(
-                expr,
-                vars,
-                stack,
-                locals,
-                this.graphBuilder.getGraph().funcMaps,
-                this.scope.buildFieldResolver(vars, stack)
-            );
-        } catch {
-            return null;
-        }
-    }
-
-    /**
-     * Fallback: ask the Go daemon to resolve hover info at the given position.
-     * The daemon walks the template scope from scratch and infers the type,
-     * which works reliably inside block/define bodies where the TS-side scope
-     * resolution may not have enough context.
-     */
     private async tryGoHoverFallback(
         document: vscode.TextDocument,
         position: vscode.Position,
@@ -275,6 +192,11 @@ export class HoverProvider {
             const label = (result as any).expression ?? 'expression';
             md.appendCodeblock(`${label}: ${result.typeStr}`, 'go');
 
+            if (result.doc) {
+                md.appendMarkdown('\n\n---\n\n');
+                md.appendMarkdown(result.doc);
+            }
+
             if (result.fields?.length) {
                 md.appendMarkdown('\n\n---\n\n**Fields:**\n\n');
                 for (const f of result.fields.slice(0, 30)) {
@@ -292,38 +214,52 @@ export class HoverProvider {
         }
     }
 
-    // ── Private helpers ────────────────────────────────────────────────────────
-
-    /**
-     * Returns the dot-path prefix that ends at the identifier segment under
-     * the cursor, so that hovering over any segment of `.Visit.Patient.ID`
-     * resolves only as far as that segment.
-     */
     extractPathAtCursor(text: string, offset: number): string | null {
-        const pathChar = /[a-zA-Z0-9_$.]/;   // includes '.' — for backward scan
-        const identChar = /[a-zA-Z0-9_$]/;    // excludes '.' — for forward scan
+        if (offset < 0 || offset > text.length) return null;
 
-        // If the cursor is sitting exactly on a dot, there is no identifier to resolve.
+        // 1. Check if cursor is inside a quoted string literal ("..." or `...`)
+        let inQuote = false;
+        let quoteChar = '';
+        let strStart = -1;
+
+        for (let i = 0; i < text.length; i++) {
+            const ch = text[i];
+            if (!inQuote && (ch === '"' || ch === '`')) {
+                inQuote = true;
+                quoteChar = ch;
+                strStart = i;
+            } else if (inQuote && ch === quoteChar && text[i - 1] !== '\\') {
+                inQuote = false;
+                const strEnd = i + 1;
+                if (offset >= strStart && offset <= strEnd) {
+                    return text.substring(strStart, strEnd);
+                }
+            }
+        }
+        if (inQuote && offset >= strStart) {
+            return text.substring(strStart);
+        }
+
+        // 2. Standard identifier / dot-path extraction
         if (offset < text.length && text[offset] === '.') return null;
 
-        // Walk backward through the whole path expression (including dots).
+        const pathChar = /[a-zA-Z0-9_$.]/;
+        const identChar = /[a-zA-Z0-9_$]/;
+
         let pathStart = offset;
         while (pathStart > 0 && pathChar.test(text[pathStart - 1])) pathStart--;
 
-        // Walk forward only through the current identifier segment (stop at next dot).
         let segEnd = offset;
         while (segEnd < text.length && identChar.test(text[segEnd])) segEnd++;
 
         if (pathStart >= segEnd) return null;
 
         const result = text.substring(pathStart, segEnd);
-        // Reject bare '$' or '.' — they have no useful sub-path to resolve.
         if (result === '.' || result === '$') return null;
 
         return result;
     }
 
-    /** Builds a hover card for a path that was successfully resolved. */
     buildHoverForPath(
         path: string[],
         result: ResolveResult | TypeResult,
@@ -333,9 +269,7 @@ export class HoverProvider {
         rawText?: string
     ): vscode.Hover {
         const varName =
-            rawText &&
-                path.length <= 1 &&
-                (path[0] === 'expression' || path[0] === 'unknown' || path.length === 0)
+            rawText && path.length <= 1 && (path[0] === 'expression' || path[0] === 'unknown' || path.length === 0)
                 ? rawText
                 : path.length > 0 && path[0] === '.'
                     ? '.'
@@ -370,20 +304,13 @@ export class HoverProvider {
         }
 
         const varInfo = this.findVariableInfo(path, vars, stack, locals);
-        // Prefer the doc carried directly on the resolved result (e.g. from a
-        // method return type's ParamInfo.doc), then fall back to the variable/field
-        // doc discovered by walking the var tree.
         const docToShow = ((result as any).doc || varInfo?.doc) as string;
         if (docToShow) {
             md.appendMarkdown('\n\n---\n\n');
             md.appendMarkdown(docToShow);
         }
 
-        // Prefer result.fields; fall back to varInfo.fields for context-file vars where
-        // the stack is empty and resolvePath may not hydrate fields for top-level vars.
-        const fieldsToShow =
-            (result.fields?.length ? result.fields : varInfo?.fields) ?? [];
-
+        const fieldsToShow = (result.fields?.length ? result.fields : varInfo?.fields) ?? [];
         if (fieldsToShow.length) {
             md.appendMarkdown('\n\n---\n\n**Fields:**\n\n');
             for (const f of fieldsToShow.slice(0, 30)) {
@@ -398,7 +325,6 @@ export class HoverProvider {
         return new vscode.Hover(md);
     }
 
-    /** Builds a hover card for the bare "." current-context reference. */
     buildDotHover(
         scopeStack: ScopeFrame[],
         vars: Map<string, TemplateVar>,
@@ -408,7 +334,6 @@ export class HoverProvider {
         const typeStr = dotFrame ? (dotFrame.typeStr ?? 'unknown') : 'RenderContext';
 
         let fields: FieldInfo[] | undefined = dotFrame?.fields;
-
         if (dotFrame && (!fields || fields.length === 0) && dotFrame.typeStr && dotFrame.typeStr !== 'context' && dotFrame.typeStr !== 'unknown') {
             fields = fieldResolver(dotFrame.typeStr) ?? [];
         }
@@ -444,10 +369,6 @@ export class HoverProvider {
         return new vscode.Hover(md);
     }
 
-    /**
-     * Checks whether position falls on the quoted name in a template/block/define tag
-     * and returns the name string if so, otherwise null.
-     */
     findTemplateNameHover(
         nodes: TemplateNode[],
         position: vscode.Position
@@ -481,8 +402,6 @@ export class HoverProvider {
         return null;
     }
 
-    // ── Private: type/doc lookup ──────────────────────────────────────────────
-
     private buildFuncMapHover(fn: FuncMapInfo): vscode.Hover {
         const md = new vscode.MarkdownString();
         md.isTrusted = true;
@@ -501,22 +420,15 @@ export class HoverProvider {
             'go'
         );
 
-        const hasUnnamedParams = params.some(p => !p.name);
         if (fn.doc?.trim()) {
             md.appendMarkdown('\n\n---\n\n');
             md.appendMarkdown(fn.doc.trim());
-        } else if (hasUnnamedParams) {
-            md.appendMarkdown(
-                '\n\n---\n\n*Parameter names unavailable (anonymous function)*'
-            );
         }
 
         return new vscode.Hover(md);
     }
 
-    private formatReturns(
-        returns: Array<{ name?: string; type: string }>
-    ): string {
+    private formatReturns(returns: Array<{ name?: string; type: string }>): string {
         if (returns.length === 0) return '';
         if (returns.length === 1) {
             return returns[0].name
@@ -526,10 +438,6 @@ export class HoverProvider {
         return `(${returns.map(r => (r.name ? `${r.name} ${r.type}` : r.type)).join(', ')})`;
     }
 
-    /**
-     * Looks up documentation and field metadata for a resolved path by walking
-     * the variable/field tree.
-     */
     private findVariableInfo(
         path: string[],
         vars: Map<string, TemplateVar>,

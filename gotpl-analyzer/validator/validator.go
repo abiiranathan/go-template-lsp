@@ -33,25 +33,19 @@ func ValidateTemplates(
 ) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
 	funcMapRegistry := BuildFuncMapRegistry(funcMaps)
 
-	// Single disk walk: load all template contents into memory once
-	store := loadTemplateStore(baseDir, templateRoot)
+	store := LoadTemplateStore(baseDir, templateRoot)
 
-	// Parse named blocks using the in-memory template store
 	namedBlocks, namedBlockErrors := parseAllNamedTemplatesFromStore(store, baseDir, templateRoot)
 
-	// Build template-name → merged var list from all render calls.
-	renderVarsByTemplate := buildRenderVarIndex(renderCalls)
+	// Build template-name → merged var list WITH partial/block propagation
+	renderVarsByTemplate := BuildPropagatedRenderVarIndex(renderCalls, namedBlocks, baseDir, templateRoot, funcMapRegistry, store)
 
-	// Find partial targets using the in-memory template store
 	partialTargets := findPartialTargetsFromStore(store)
 
-	// Validate render-call targets using in-memory templates
 	renderErrors := validateRenderCallsConcurrently(store, renderCalls, baseDir, templateRoot, namedBlocks, partialTargets, funcMapRegistry)
 
-	// Validate all un-rendered files in the tree from memory
 	treeErrors := validateTemplateTreeFromStore(store, baseDir, templateRoot, namedBlocks, renderVarsByTemplate, partialTargets, funcMapRegistry)
 
-	// Validate orphaned named blocks
 	blockErrors := validateOrphanedNamedBlocks(namedBlocks, renderVarsByTemplate, baseDir, templateRoot, partialTargets, funcMapRegistry)
 
 	allErrors := append(renderErrors, treeErrors...)
@@ -73,7 +67,7 @@ var templateRegex = regexp.MustCompile(`\{\{-?\s*(?:template|block|define)\s+["'
 // FindPartialTargets scans all template files to find targets of {{template "..."}} or {{block "..."}} calls.
 // Exported for daemon and external callers.
 func FindPartialTargets(baseDir, templateRoot string) map[string]bool {
-	store := loadTemplateStore(baseDir, templateRoot)
+	store := LoadTemplateStore(baseDir, templateRoot)
 	return findPartialTargetsFromStore(store)
 }
 
@@ -88,8 +82,8 @@ func findPartialTargetsFromStore(store TemplateStore) map[string]bool {
 	return targets
 }
 
-// loadTemplateStore performs a single filepath.WalkDir and reads all template files into memory.
-func loadTemplateStore(baseDir, templateRoot string) TemplateStore {
+// LoadTemplateStore performs a single filepath.WalkDir and reads all template files into memory.
+func LoadTemplateStore(baseDir, templateRoot string) TemplateStore {
 	store := make(TemplateStore)
 	root := filepath.Join(baseDir, templateRoot)
 
@@ -105,6 +99,168 @@ func loadTemplateStore(baseDir, templateRoot string) TemplateStore {
 		return nil
 	})
 	return store
+}
+
+// BuildPropagatedRenderVarIndex creates a template-name → merged TemplateVar map.
+// It starts with direct RenderCall variables and propagates variables through
+// {{ template "name" ctx }} and {{ block "name" ctx }} calls until convergence.
+func BuildPropagatedRenderVarIndex(
+	renderCalls []ast.RenderCall,
+	namedBlocks map[string][]NamedBlockEntry,
+	baseDir, templateRoot string,
+	funcMaps FuncMapRegistry,
+	store TemplateStore,
+) map[string][]ast.TemplateVar {
+	idx := buildRenderVarIndex(renderCalls)
+
+	type queueItem struct {
+		name string
+	}
+
+	queue := make([]queueItem, 0, len(idx))
+	inQueue := make(map[string]bool)
+
+	for name := range idx {
+		queue = append(queue, queueItem{name: name})
+		inQueue[name] = true
+	}
+
+	getContent := func(name string) string {
+		absPath := filepath.Join(baseDir, templateRoot, name)
+		if content, ok := store[absPath]; ok {
+			return content
+		}
+		for storeAbs, content := range store {
+			if strings.HasSuffix(normalizePath(storeAbs), normalizePath(name)) {
+				return content
+			}
+		}
+		if entries, ok := namedBlocks[name]; ok && len(entries) > 0 {
+			return entries[0].Content
+		}
+		return ""
+	}
+
+	for len(queue) > 0 {
+		item := queue[0]
+		queue = queue[1:]
+		inQueue[item.name] = false
+
+		currentVars := idx[item.name]
+		if len(currentVars) == 0 {
+			continue
+		}
+
+		content := getContent(item.name)
+		if content == "" {
+			continue
+		}
+
+		varMap := buildVarMap(currentVars)
+		var scopeStack []ScopeType
+		rootScope := buildRootScope(varMap)
+		scopeStack = append(scopeStack, rootScope)
+
+		calls := extractTemplateAndBlockCalls(content)
+
+		for _, call := range calls {
+			targetName := call.target
+			contextArg := call.contextArg
+
+			partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
+			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+			propagatedVars := scopeVarsToTemplateVars(partialVarMap)
+
+			if len(propagatedVars) == 0 {
+				continue
+			}
+
+			changed := mergeVarsIntoIndex(idx, targetName, propagatedVars)
+
+			if entries, ok := namedBlocks[targetName]; ok && len(entries) > 0 {
+				relPath := entries[0].TemplatePath
+				if relPath != "" && relPath != targetName {
+					if mergeVarsIntoIndex(idx, relPath, propagatedVars) {
+						changed = true
+					}
+				}
+			}
+
+			if changed && !inQueue[targetName] {
+				queue = append(queue, queueItem{name: targetName})
+				inQueue[targetName] = true
+			}
+		}
+	}
+
+	return idx
+}
+
+type templateCallInfo struct {
+	target     string
+	contextArg string
+}
+
+func extractTemplateAndBlockCalls(content string) []templateCallInfo {
+	var calls []templateCallInfo
+	cur := 0
+	for cur < len(content) {
+		openRel := strings.Index(content[cur:], "{{")
+		if openRel == -1 {
+			break
+		}
+		openIdx := cur + openRel
+		closeRel := strings.Index(content[openIdx:], "}}")
+		if closeRel == -1 {
+			break
+		}
+		closeIdx := openIdx + closeRel
+
+		action := strings.TrimSpace(content[openIdx+2 : closeIdx])
+		action = strings.TrimPrefix(action, "-")
+		action = strings.TrimSuffix(action, "-")
+		action = strings.TrimSpace(action)
+
+		cur = closeIdx + 2
+
+		if strings.HasPrefix(action, "template ") || strings.HasPrefix(action, "block ") {
+			parts := parseTemplateAction(action)
+			if len(parts) >= 1 {
+				target := parts[0]
+				ctxArg := "."
+				if len(parts) >= 2 {
+					ctxArg = parts[1]
+				}
+				calls = append(calls, templateCallInfo{
+					target:     target,
+					contextArg: ctxArg,
+				})
+			}
+		}
+	}
+	return calls
+}
+
+func mergeVarsIntoIndex(idx map[string][]ast.TemplateVar, key string, newVars []ast.TemplateVar) bool {
+	existing := idx[key]
+	seen := make(map[string]bool, len(existing)+len(newVars))
+	for _, v := range existing {
+		seen[v.Name] = true
+	}
+
+	changed := false
+	for _, v := range newVars {
+		if !seen[v.Name] {
+			seen[v.Name] = true
+			existing = append(existing, v)
+			changed = true
+		}
+	}
+
+	if changed {
+		idx[key] = existing
+	}
+	return changed
 }
 
 func parseAllNamedTemplatesFromStore(store TemplateStore, baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {

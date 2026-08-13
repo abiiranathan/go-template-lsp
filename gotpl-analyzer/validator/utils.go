@@ -7,21 +7,15 @@ import (
 	"github.com/abiiranathan/go-template-lsp/gotpl-analyzer/ast"
 )
 
+// normalizePath returns a cleaned, lowercased version of a file path for
+// case-insensitive comparison.
+func normalizePath(value string) string {
+	return filepath.ToSlash(filepath.Clean(strings.ToLower(value)))
+}
+
 // IsFileBasedPartial determines if a template name refers to a file path
 // rather than a named block.
-//
-// Detection criteria:
-//   - Contains path separators (/ or \)
-//   - Has a recognized template file extension
-//
-// Recognized extensions:
-//   - .html, .htm
-//   - .tmpl, .tpl
-//   - .gohtml
-//
-// Thread-safety: Pure function, safe for concurrent calls.
 func IsFileBasedPartial(name string) bool {
-	// Check for template file extensions
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
 	case ".html", ".tmpl", ".gohtml", ".tpl", ".htm":
@@ -36,7 +30,6 @@ func isWhitespace(b byte) bool {
 }
 
 // ValidateTemplateFileStr exposes internal validation for testing.
-// Validates template content string with provided variables.
 func ValidateTemplateFileStr(
 	content string,
 	vars []ast.TemplateVar,

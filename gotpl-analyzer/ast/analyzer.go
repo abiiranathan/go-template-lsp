@@ -6,30 +6,40 @@ package ast
 
 import (
 	"fmt"
-	goast "go/ast"
 	"go/token"
+	"sync"
 
 	"golang.org/x/tools/go/packages"
 )
 
-// AnalyzeDir performs comprehensive static analysis on Go source code and returns
-// an AnalysisResult containing all discovered template-related information.
-//
-// Performance strategy (fastest first):
-//  1. Disk cache hit  → deserialise gzip-JSON (~150 ms), skip packages.Load entirely.
-//  2. In-process cache hit → skip struct-index rebuild, still calls packages.Load once.
-//  3. Cold path → single packages.Load, build indexes, write disk cache for next run.
-//
-// Previously the function called packages.Load 2–3 times per invocation (main
-// analysis + optional context-enrichment reload).  It now loads exactly once and
-// passes the pkgs slice to every downstream step, eliminating the redundant
-// packages.Load that previously happened inside the context-enrichment branch.
+var (
+	// globalPkgCache caches loaded packages across runs to speed up incremental builds.
+	globalPkgCache   = make(map[string]*AnalysisResult)
+	globalPkgCacheMu sync.RWMutex
+)
+
+// InvalidateCache evicts all in-memory Go AST cache entries.
+func InvalidateCache() {
+	globalPkgCacheMu.Lock()
+	clear(globalPkgCache)
+	globalPkgCacheMu.Unlock()
+}
+
+// AnalyzeDir performs static analysis with in-memory caching.
 func AnalyzeDir(dir string, contextFile string, config *AnalysisConfig) AnalysisResult {
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
+
+	// Load configuration optimized for template data extraction.
+	// Tests: false avoids compiling test binaries and prevents lock contention.
 	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports,
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedCompiledGoFiles |
+			packages.NeedImports |
+			packages.NeedTypes |
+			packages.NeedTypesInfo |
+			packages.NeedSyntax,
 		Dir:   dir,
 		Fset:  fset,
 		Tests: false,
@@ -44,28 +54,25 @@ func AnalyzeDir(dir string, contextFile string, config *AnalysisConfig) Analysis
 
 	info, allFiles := mergeTypeInfo(pkgs, &result)
 
-	var filesMap map[string]*goast.File
-	var structIndex map[string]structIndexEntry
-
-	filesMap = buildFileMap(allFiles, fset)
-	structIndex = buildStructIndex(fset, filesMap)
+	filesMap := buildFileMap(allFiles, fset)
+	structIndex := buildStructIndex(fset, filesMap)
 
 	fc := newFieldCache()
 	seenPool := newSeenMapPool()
 
-	//  Collect function scopes (concurrent)
+	// Collect function scopes concurrently
 	scopes := collectFuncScopesOptimized(allFiles, info, fset, structIndex, fc, config, filesMap, seenPool)
 
-	// Extract global implicit variables
+	// Extract global implicit variables (e.g. middleware c.Set())
 	globalImplicitVars := extractGlobalImplicitVars(scopes)
 
 	// Generate render calls
 	result.RenderCalls = generateRenderCalls(scopes, globalImplicitVars, info, fset, dir, structIndex, fc, seenPool)
 
-	// Aggregate function maps
+	// Aggregate template function maps
 	result.FuncMaps = aggregateFuncMaps(scopes)
 
-	// Context enrichment – reuse already-loaded pkgs, no second Load! ───
+	// Context enrichment from JSON if specified
 	if contextFile != "" {
 		result.RenderCalls = enrichRenderCallsWithContext(
 			result.RenderCalls, contextFile, pkgs, structIndex, fc, fset, config, seenPool,

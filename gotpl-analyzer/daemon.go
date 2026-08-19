@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -217,6 +218,9 @@ type analyzerDaemon struct {
 
 	// templateOverlays maps absolute template file paths to their unsaved editor buffer content.
 	templateOverlays map[string]string
+
+	// Serializes analyze requests to avoid multiple concurrent packages.Load calls
+	analyzeMu sync.Mutex
 }
 
 // runDaemon starts a JSON-RPC 2.0 server over stdin/stdout that serves
@@ -417,6 +421,9 @@ func (p daemonAnalyzeParams) toAnalysisConfig() *ast.AnalysisConfig {
 // if only templates changed, Go analysis is reused; otherwise a full packages.Load
 // is performed.
 func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, error) {
+	d.analyzeMu.Lock()
+	defer d.analyzeMu.Unlock()
+
 	baseDir := params.Dir
 	if params.TemplateBaseDir != "" {
 		baseDir = params.TemplateBaseDir
@@ -428,23 +435,21 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 
 	prev := d.state.Load()
 
-	// Fast path: nothing changed at all — return cached output.
+	// Fast Path 1: Absolute cache hit — no file touched at all
 	if prev != nil && prev.goFingerprint == goFP && prev.templateFingerprint == tmplFP &&
 		prev.dir == params.Dir && prev.templateRoot == params.TemplateRoot &&
 		prev.contextFile == params.ContextFile && prev.validate == params.Validate {
 		return prev.output, nil
 	}
 
-	// Semi-fast path: only templates changed — skip packages.Load, reuse Go analysis.
+	// Fast Path 2: Only templates changed — reuse parsed Go AST and types
 	if prev != nil && prev.goFingerprint == goFP && prev.analysisResult != nil &&
 		prev.dir == params.Dir && prev.contextFile == params.ContextFile {
 		return d.buildSnapshotFromResult(prev.analysisResult, params, baseDir, goFP, tmplFP)
 	}
 
-	// Cold path: full analysis required.
-	// Pass user configuration to AnalyzeDir
+	// Cold path: Full Go source analysis
 	result := ast.AnalyzeDir(params.Dir, params.ContextFile, params.toAnalysisConfig())
-
 	result.Errors = filterImportErrors(result.Errors)
 
 	return d.buildSnapshotFromResult(&result, params, baseDir, goFP, tmplFP)
@@ -531,12 +536,6 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 
 	d.state.Store(snap)
 
-	if d.templateOverlays == nil {
-		d.overlayMu.Lock()
-		d.templateOverlays = make(map[string]string)
-		d.overlayMu.Unlock()
-	}
-
 	return output, nil
 }
 
@@ -558,32 +557,6 @@ func mergeVarSlices(a, b []ast.TemplateVar) []ast.TemplateVar {
 	return res
 }
 
-func findRenderVarsForTemplateWithRegistry(
-	renderVarsByTemplate map[string][]ast.TemplateVar,
-	absPath, baseDir, templateRoot string,
-	registry map[string][]validator.NamedBlockEntry,
-) (string, []ast.TemplateVar, bool) {
-	if key, vars, ok := findRenderVarsForTemplate(renderVarsByTemplate, absPath, baseDir, templateRoot); ok {
-		return key, vars, true
-	}
-
-	normalizedAbs := normalizePath(absPath)
-	for blockName, entries := range registry {
-		for _, entry := range entries {
-			if normalizePath(entry.AbsolutePath) == normalizedAbs {
-				if vars, ok := renderVarsByTemplate[blockName]; ok && len(vars) > 0 {
-					return blockName, vars, true
-				}
-			}
-		}
-	}
-
-	return "", nil, false
-}
-
-// reanalyzeTemplates re-runs only the template validation step using the
-// existing Go analysis result. This is much faster than a full analyze when
-// only template files have changed.
 func (d *analyzerDaemon) reanalyzeTemplates(params daemonAnalyzeParams) (ValidationOutput, error) {
 	prev := d.state.Load()
 	if prev == nil || prev.analysisResult == nil {
@@ -598,6 +571,11 @@ func (d *analyzerDaemon) reanalyzeTemplates(params daemonAnalyzeParams) (Validat
 
 	goFP := prev.goFingerprint
 	tmplFP := computeTemplateFingerprint(baseDir, params.TemplateRoot)
+
+	// If neither Go nor templates changed, return previous output immediately
+	if prev.templateFingerprint == tmplFP {
+		return prev.output, nil
+	}
 
 	return d.buildSnapshotFromResult(prev.analysisResult, params, baseDir, goFP, tmplFP)
 }
@@ -621,8 +599,7 @@ func cloneAnalysisResult(r *ast.AnalysisResult) *ast.AnalysisResult {
 	return clone
 }
 
-// computeGoFingerprint builds a hash from all .go file paths and their
-// modification times under dir (excluding vendor, node_modules, testdata).
+// computeGoFingerprint creates an mtime-based fingerprint of all Go source files.
 func computeGoFingerprint(dir string) string {
 	h := sha256.New()
 	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
@@ -631,8 +608,7 @@ func computeGoFingerprint(dir string) string {
 		}
 		if d.IsDir() {
 			name := d.Name()
-			if name == "vendor" || name == "node_modules" || name == "testdata" ||
-				strings.HasPrefix(name, ".") {
+			if name == "vendor" || name == "node_modules" || name == "testdata" || strings.HasPrefix(name, ".") {
 				return filepath.SkipDir
 			}
 			return nil
@@ -646,15 +622,13 @@ func computeGoFingerprint(dir string) string {
 		}
 		return nil
 	})
-	// Also include go.sum if present.
 	if info, err := os.Stat(filepath.Join(dir, "go.sum")); err == nil {
 		fmt.Fprintf(h, "go.sum:%d\n", info.ModTime().UnixNano())
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// computeTemplateFingerprint builds a hash from all template file paths and
-// their modification times under baseDir/templateRoot.
+// computeTemplateFingerprint creates an mtime-based fingerprint of template files.
 func computeTemplateFingerprint(baseDir, templateRoot string) string {
 	root := filepath.Join(baseDir, templateRoot)
 	h := sha256.New()
@@ -674,9 +648,6 @@ func computeTemplateFingerprint(baseDir, templateRoot string) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-// validateTemplate validates a single template file against the current analysis
-// snapshot. It applies any in-memory overlays, resolves the template's render-call
-// variables, and returns validation errors along with whether context was available.
 func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (result daemonValidateTemplateResult, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -740,10 +711,7 @@ func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (
 	}
 
 	for _, entry := range registryEntriesForFile(registry, absPath) {
-		if entry.Name == entry.TemplatePath {
-			continue
-		}
-		if snap.partialTargets[entry.Name] {
+		if entry.Name == entry.TemplatePath || snap.partialTargets[entry.Name] {
 			continue
 		}
 		vars, ok := snap.renderVarsByTemplate[entry.Name]
@@ -878,7 +846,28 @@ func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validat
 	return result, nil
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+func findRenderVarsForTemplateWithRegistry(
+	renderVarsByTemplate map[string][]ast.TemplateVar,
+	absPath, baseDir, templateRoot string,
+	registry map[string][]validator.NamedBlockEntry,
+) (string, []ast.TemplateVar, bool) {
+	if key, vars, ok := findRenderVarsForTemplate(renderVarsByTemplate, absPath, baseDir, templateRoot); ok {
+		return key, vars, true
+	}
+
+	normalizedAbs := normalizePath(absPath)
+	for blockName, entries := range registry {
+		for _, entry := range entries {
+			if normalizePath(entry.AbsolutePath) == normalizedAbs {
+				if vars, ok := renderVarsByTemplate[blockName]; ok && len(vars) > 0 {
+					return blockName, vars, true
+				}
+			}
+		}
+	}
+
+	return "", nil, false
+}
 
 // findRenderVarsForTemplate looks up the template variables associated with a
 // template file by trying several key normalization strategies (relative path,
@@ -933,9 +922,7 @@ func cloneRegistry(in map[string][]validator.NamedBlockEntry) map[string][]valid
 // so that reads under RLock can safely iterate without holding the lock.
 func cloneTemplateOverlays(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
+	maps.Copy(out, in)
 	return out
 }
 
@@ -952,9 +939,6 @@ func applyTemplateOverlays(registry map[string][]validator.NamedBlockEntry, over
 	}
 }
 
-// replaceRegistryEntriesForFile removes all existing named block entries for a
-// file from the registry, then re-extracts named templates from the new content
-// and adds them back along with a whole-file entry.
 func replaceRegistryEntriesForFile(registry map[string][]validator.NamedBlockEntry, absolutePath, content, templatePath string) {
 	normalizedPath := normalizePath(absolutePath)
 	for name, entries := range registry {

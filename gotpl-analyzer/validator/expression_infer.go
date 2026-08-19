@@ -3,6 +3,7 @@ package validator
 import (
 	"fmt"
 	"maps"
+	"slices"
 	"strings"
 	"text/template"
 	templateparse "text/template/parse"
@@ -21,6 +22,24 @@ type ExpressionTypeResult struct {
 	Returns  []ast.ParamInfo `json:"returns,omitempty"`
 	Doc      string          `json:"doc,omitempty"`
 	Literal  string          `json:"-"`
+}
+
+// ArgTypeMismatch describes a single argument whose inferred type does not match
+// the function's declared parameter type. Pos is the byte offset of the argument
+// within the parsed expression string.
+type ArgTypeMismatch struct {
+	// FuncName is the name of the function being called.
+	FuncName string
+	// ArgIndex is the zero-based index of the offending argument.
+	ArgIndex int
+	// ParamName is the declared name of the parameter (may be empty).
+	ParamName string
+	// Expected is the declared parameter type string.
+	Expected string
+	// Actual is the inferred type string of the passed argument.
+	Actual string
+	// Pos is the argument's byte offset within the expression string.
+	Pos templateparse.Pos
 }
 
 type expressionInferencer struct {
@@ -107,12 +126,14 @@ func parseExpressionTree(expr string, funcMaps FuncMapRegistry, localVarNames []
 	}
 
 	// Pre-declare local $variables so Go's template parser accepts them
-	var prefix string
+	var prefix strings.Builder
 	for _, name := range localVarNames {
-		prefix += "{{ " + name + " := . }}"
+		prefix.WriteString("{{ ")
+		prefix.WriteString(name)
+		prefix.WriteString(" := . }}")
 	}
 
-	tmpl, err := template.New("expr").Funcs(funcDefs).Parse(prefix + "{{ " + expr + " }}")
+	tmpl, err := template.New("expr").Funcs(funcDefs).Parse(prefix.String() + "{{ " + expr + " }}")
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +179,231 @@ func (i expressionInferencer) inferCommand(cmd *templateparse.CommandNode, piped
 	}
 
 	return i.hydrateResult(i.inferNode(cmd.Args[0]))
+}
+
+// ValidateFunctionCallArgTypes infers the type of every argument passed to a
+// registered template function inside expr and returns the mismatches against
+// the function's declared parameter types. Positions are relative to expr.
+func ValidateFunctionCallArgTypes(
+	expr string,
+	vars map[string]ast.TemplateVar,
+	scopeStack []ScopeType,
+	blockLocals map[string]ast.TemplateVar,
+	funcMaps FuncMapRegistry,
+	typeRegistry map[string][]ast.FieldInfo,
+) []ArgTypeMismatch {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return nil
+	}
+
+	inferencer := expressionInferencer{
+		vars:         cloneTemplateVarMap(vars),
+		scopeStack:   cloneScopeStack(scopeStack),
+		blockLocals:  cloneTemplateVarMap(blockLocals),
+		funcMaps:     maps.Clone(funcMaps),
+		typeRegistry: maps.Clone(typeRegistry),
+	}
+
+	localVarNames := inferencer.collectLocalVarNames()
+	tree, err := parseExpressionTree(expr, funcMaps, localVarNames)
+	if err != nil {
+		return nil
+	}
+
+	// Node positions are relative to (prefix + "{{ " + expr + " }}"). Compute the
+	// offset of expr within that string so reported positions are expr-relative.
+	base := templateparse.Pos(len(prefixForLocalVars(localVarNames)) + len("{{ "))
+
+	// Skip the pre-declaration actions and only inspect the last action (the real expression).
+	for _, v := range slices.Backward(tree.Root.Nodes) {
+		action, ok := v.(*templateparse.ActionNode)
+		if !ok {
+			continue
+		}
+		mismatches := inferencer.validatePipeArgTypes(action.Pipe)
+		for m := range mismatches {
+			if mismatches[m].Pos >= base {
+				mismatches[m].Pos -= base
+			}
+		}
+		return mismatches
+	}
+	return nil
+}
+
+// prefixForLocalVars reproduces the pre-declaration prefix built by parseExpressionTree.
+func prefixForLocalVars(localVarNames []string) string {
+	var prefix strings.Builder
+	for _, name := range localVarNames {
+		prefix.WriteString("{{ ")
+		prefix.WriteString(name)
+		prefix.WriteString(" := . }}")
+	}
+	return prefix.String()
+}
+
+// validatePipeArgTypes walks every command of a pipe, recursively validating
+// nested pipes, and reports argument type mismatches for registered functions.
+func (i expressionInferencer) validatePipeArgTypes(pipe *templateparse.PipeNode) []ArgTypeMismatch {
+	if pipe == nil {
+		return nil
+	}
+
+	var mismatches []ArgTypeMismatch
+	var piped *ExpressionTypeResult
+	for _, cmd := range pipe.Cmds {
+		if cmd == nil || len(cmd.Args) == 0 {
+			continue
+		}
+
+		for _, arg := range cmd.Args {
+			if sub, ok := arg.(*templateparse.PipeNode); ok {
+				mismatches = append(mismatches, i.validatePipeArgTypes(sub)...)
+			}
+		}
+
+		if ident, ok := cmd.Args[0].(*templateparse.IdentifierNode); ok {
+			args := make([]*ExpressionTypeResult, 0, len(cmd.Args)-1+boolToInt(piped != nil))
+			for _, arg := range cmd.Args[1:] {
+				args = append(args, i.inferNode(arg))
+			}
+			if piped != nil {
+				args = append(args, piped)
+			}
+			mismatches = append(mismatches, i.checkCommandArgTypes(ident.Ident, cmd.Args[1:], args, cmd.Position())...)
+			piped = i.hydrateResult(i.inferFunctionCall(ident.Ident, cmd.Args[1:], args))
+		} else if len(cmd.Args) == 1 {
+			piped = i.hydrateResult(i.inferNode(cmd.Args[0]))
+		} else {
+			piped = i.hydrateResult(i.inferNode(cmd.Args[0]))
+		}
+	}
+	return mismatches
+}
+
+// checkCommandArgTypes compares each inferred argument type against the declared
+// parameter types of the named function.
+func (i expressionInferencer) checkCommandArgTypes(funcName string, rawArgs []templateparse.Node, args []*ExpressionTypeResult, fallbackPos templateparse.Pos) []ArgTypeMismatch {
+	fn, ok := i.funcMaps[funcName]
+	if !ok || len(fn.Params) == 0 {
+		return nil
+	}
+
+	isVariadic := false
+	variadicType := ""
+	if last := fn.Params[len(fn.Params)-1]; strings.HasPrefix(last.TypeStr, "...") {
+		isVariadic = true
+		variadicType = strings.TrimPrefix(last.TypeStr, "...")
+	}
+
+	var mismatches []ArgTypeMismatch
+	for idx, arg := range args {
+		expected := ""
+		if isVariadic && idx >= len(fn.Params)-1 {
+			expected = variadicType
+		} else if idx < len(fn.Params) {
+			expected = fn.Params[idx].TypeStr
+		} else {
+			continue
+		}
+
+		if typesCompatible(expected, arg) {
+			continue
+		}
+
+		pos := fallbackPos
+		if idx < len(rawArgs) {
+			pos = rawArgs[idx].Position()
+		}
+
+		paramIdx := idx
+		if paramIdx >= len(fn.Params) {
+			paramIdx = len(fn.Params) - 1
+		}
+
+		mismatches = append(mismatches, ArgTypeMismatch{
+			FuncName:  funcName,
+			ArgIndex:  idx,
+			ParamName: fn.Params[paramIdx].Name,
+			Expected:  expected,
+			Actual:    arg.TypeStr,
+			Pos:       pos,
+		})
+	}
+	return mismatches
+}
+
+// typesCompatible reports whether an inferred argument type can satisfy the
+// declared parameter type. It is intentionally lenient to avoid false positives:
+// unknown, any, context, and nil arguments are always accepted, pointers are
+// unwrapped, and the numeric family is treated as compatible (template number
+// literals are untyped constants).
+func typesCompatible(expected string, actual *ExpressionTypeResult) bool {
+	if actual == nil {
+		return true
+	}
+	expected = strings.TrimSpace(expected)
+	actualStr := strings.TrimSpace(actual.TypeStr)
+	if expected == "" || expected == "any" || expected == "interface{}" {
+		return true
+	}
+	if actualStr == "" || actualStr == "any" || actualStr == "interface{}" || actualStr == "unknown" || actualStr == "context" || actualStr == "nil" {
+		return true
+	}
+
+	// Unwrap pointer prefixes on both sides.
+	exp := strings.TrimLeft(expected, "*")
+	act := strings.TrimLeft(actualStr, "*")
+
+	if exp == act {
+		return true
+	}
+
+	expIsSlice := strings.HasPrefix(exp, "[]")
+	expIsMap := strings.HasPrefix(exp, "map[")
+	actIsSlice := strings.HasPrefix(act, "[]") || actual.IsSlice
+	actIsMap := strings.HasPrefix(act, "map[") || actual.IsMap
+
+	if expIsSlice != actIsSlice || expIsMap != actIsMap {
+		return false
+	}
+
+	if expIsSlice {
+		return typesCompatible(unwrapCollectionElemType(exp), &ExpressionTypeResult{TypeStr: unwrapCollectionElemType(act)})
+	}
+
+	if expIsMap {
+		if !typesCompatible(unwrapMapKeyType(exp), &ExpressionTypeResult{TypeStr: unwrapMapKeyType(act)}) {
+			return false
+		}
+		return typesCompatible(unwrapCollectionElemType(exp), &ExpressionTypeResult{TypeStr: unwrapCollectionElemType(act)})
+	}
+
+	// Untyped numeric constants in templates allow cross int/float arguments.
+	if isNumericTypeName(exp) && isNumericTypeName(act) {
+		return true
+	}
+
+	// Both named types: compare the bare type names.
+	if !isPrimitiveTypeName(exp) && !isPrimitiveTypeName(act) {
+		return extractBareType(exp) == extractBareType(act)
+	}
+
+	// One side is primitive and the other is not (or both are distinct primitives).
+	return false
+}
+
+// stripAssignmentPrefix removes a leading "{{ $x := ... }}" / "{{ $a, $b := ... }}"
+// assignment so the remaining expression can be parsed standalone.
+func stripAssignmentPrefix(expr string) string {
+	trimmed := strings.TrimSpace(expr)
+	if strings.HasPrefix(trimmed, "$") {
+		if _, after, ok := strings.Cut(trimmed, ":="); ok {
+			return strings.TrimSpace(after)
+		}
+	}
+	return trimmed
 }
 
 func (i expressionInferencer) inferNode(node templateparse.Node) *ExpressionTypeResult {
@@ -242,7 +488,16 @@ func (i expressionInferencer) resolveVariablePath(parts []string) *ExpressionTyp
 		if len(parts) == 1 {
 			return &ExpressionTypeResult{TypeStr: "context", Fields: buildRootScope(i.vars).Fields}
 		}
-		if rootVar, ok := i.vars[parts[1]]; ok {
+		name := parts[1]
+		if v, ok := i.blockLocals[name]; ok {
+			return i.resolveChainedField(templateVarToExpressionResult(v), parts[2:])
+		}
+		for _, v := range slices.Backward(i.scopeStack) {
+			if local, ok := v.Locals[name]; ok {
+				return i.resolveChainedField(templateVarToExpressionResult(local), parts[2:])
+			}
+		}
+		if rootVar, ok := i.vars[name]; ok {
 			result := templateVarToExpressionResult(rootVar)
 			return i.resolveChainedField(result, parts[2:])
 		}
@@ -253,8 +508,8 @@ func (i expressionInferencer) resolveVariablePath(parts []string) *ExpressionTyp
 	if v, ok := i.blockLocals[name]; ok {
 		return i.resolveChainedField(templateVarToExpressionResult(v), parts[1:])
 	}
-	for idx := len(i.scopeStack) - 1; idx >= 0; idx-- {
-		if local, ok := i.scopeStack[idx].Locals[name]; ok {
+	for _, v := range slices.Backward(i.scopeStack) {
+		if local, ok := v.Locals[name]; ok {
 			return i.resolveChainedField(templateVarToExpressionResult(local), parts[1:])
 		}
 	}

@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"maps"
 	"strings"
 	"unicode"
 
@@ -467,9 +468,7 @@ func extractHoverExpression(action, first string) string {
 func collectLocals(scopeStack []ScopeType) map[string]ast.TemplateVar {
 	result := make(map[string]ast.TemplateVar)
 	for _, frame := range scopeStack {
-		for k, v := range frame.Locals {
-			result[k] = v
-		}
+		maps.Copy(result, frame.Locals)
 	}
 	return result
 }

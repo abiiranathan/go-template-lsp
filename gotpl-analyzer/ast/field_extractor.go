@@ -216,8 +216,8 @@ func extractMethodFields(
 
 	fields := make([]FieldInfo, 0, methodSet.Len())
 
-	for i := 0; i < methodSet.Len(); i++ {
-		sel := methodSet.At(i)
+	for sel := range methodSet.Methods() {
+		sel := sel
 		if !sel.Obj().Exported() {
 			continue
 		}

@@ -207,6 +207,7 @@ func validateTemplateContentWithRegistry(
 
 		assignmentTargets := assignmentTargetSet(action)
 		errors = append(errors, validateActionFunctions(action, first, templateName, actualLineNum, col, effectiveFuncMaps)...)
+		errors = append(errors, validateFunctionCallArgTypes(action, first, content, templateName, contentStart, scopeStack, varMap, effectiveFuncMaps)...)
 		extractVariablesFromAction(action, func(v string) {
 			if assignmentTargets[v] {
 				return
@@ -214,10 +215,7 @@ func validateTemplateContentWithRegistry(
 			if err := validateVariableInScope(v, scopeStack, varMap); err != nil {
 				err.Template = templateName
 				err.Line = actualLineNum
-				err.Column = col + strings.Index(action, v)
-				if err.Column < col {
-					err.Column = col
-				}
+				err.Column = max(col+strings.Index(action, v), col)
 				errors = append(errors, *err)
 			}
 		})
@@ -519,7 +517,7 @@ func splitAssignment(action string) ([]string, string, bool) {
 	fields := strings.Split(lhs, ",")
 	names := make([]string, 0, len(fields))
 	for _, field := range fields {
-		for _, token := range strings.Fields(strings.TrimSpace(field)) {
+		for token := range strings.FieldsSeq(strings.TrimSpace(field)) {
 			if strings.HasPrefix(token, "$") {
 				names = append(names, token)
 			}
@@ -643,6 +641,91 @@ func validateActionFunctions(action, first, templateName string, line, col int, 
 		return validateExpressionFunctions(strings.TrimSpace(strings.TrimPrefix(trimmed, first)), templateName, line, col, funcMaps)
 	}
 	return validateExpressionFunctions(trimmed, templateName, line, col, funcMaps)
+}
+
+// validateFunctionCallArgTypes infers the types of all arguments passed to
+// registered template functions in the action and reports type mismatches
+// against the declared parameter types. Positions are computed from the byte
+// offset of each argument within the content.
+func validateFunctionCallArgTypes(
+	action, first, content, templateName string,
+	contentStart int,
+	scopeStack []ScopeType,
+	varMap map[string]ast.TemplateVar,
+	funcMaps FuncMapRegistry,
+) []ValidationResult {
+	if funcMaps == nil {
+		return nil
+	}
+
+	expr, ok := extractExpressionForTypeCheck(action, first)
+	if !ok {
+		return nil
+	}
+
+	// Fast path: skip parsing entirely when the expression references no
+	// registered function that declares parameter types.
+	referencesTypedFunc := false
+	for _, candidate := range functionCandidates(expr) {
+		if fn, exists := funcMaps[candidate.name]; exists && len(fn.Params) > 0 {
+			referencesTypedFunc = true
+			break
+		}
+	}
+	if !referencesTypedFunc {
+		return nil
+	}
+
+	mismatches := ValidateFunctionCallArgTypes(expr, varMap, scopeStack, nil, funcMaps, nil)
+	if len(mismatches) == 0 {
+		return nil
+	}
+
+	exprOffset := max(strings.Index(action, expr), 0)
+
+	var errors []ValidationResult
+	for _, m := range mismatches {
+		offset := contentStart + exprOffset + int(m.Pos)
+		line, col := calculateNodeLineCol(content, offset)
+		message := fmt.Sprintf("Wrong type for argument %d of %q: expected %s, got %s", m.ArgIndex+1, m.FuncName, m.Expected, m.Actual)
+		if m.ParamName != "" {
+			message = fmt.Sprintf("Wrong type for parameter %q of %q: expected %s, got %s", m.ParamName, m.FuncName, m.Expected, m.Actual)
+		}
+		errors = append(errors, ValidationResult{
+			Template: templateName,
+			Line:     line,
+			Column:   col,
+			Variable: m.FuncName,
+			Message:  message,
+			Severity: "error",
+		})
+	}
+	return errors
+}
+
+// extractExpressionForTypeCheck returns the expression portion of an action that
+// may contain function calls, stripping control keywords and assignment prefixes.
+func extractExpressionForTypeCheck(action, first string) (string, bool) {
+	trimmed := strings.TrimSpace(action)
+	switch first {
+	case "template", "block", "define", "end":
+		return "", false
+	case "else":
+		switch {
+		case strings.HasPrefix(trimmed, "else if "):
+			return stripAssignmentPrefix(strings.TrimSpace(strings.TrimPrefix(trimmed, "else if"))), true
+		case strings.HasPrefix(trimmed, "else with "):
+			return stripAssignmentPrefix(strings.TrimSpace(strings.TrimPrefix(trimmed, "else with"))), true
+		case strings.HasPrefix(trimmed, "else range "):
+			return stripAssignmentPrefix(strings.TrimSpace(strings.TrimPrefix(trimmed, "else range"))), true
+		default:
+			return "", false
+		}
+	case "if", "with", "range":
+		return stripAssignmentPrefix(strings.TrimSpace(strings.TrimPrefix(trimmed, first))), true
+	default:
+		return stripAssignmentPrefix(trimmed), true
+	}
 }
 
 func validateExpressionFunctions(expr, templateName string, line, col int, funcMaps FuncMapRegistry) []ValidationResult {

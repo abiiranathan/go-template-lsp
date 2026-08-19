@@ -62,7 +62,7 @@
     {{ $large := index $.billedDrugs 0 }}
     {{ $drugName := $large.Name }}
 
-    {{ $authUser := getAuthUser "name" }}
+    {{ $authUser := getAuthUser 1 }}
     {{ $authUser.Name }}
 
     {{ block "prescription-summary" . }}

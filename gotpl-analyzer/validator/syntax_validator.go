@@ -200,8 +200,8 @@ func parseTemplateSyntaxError(errStr string, templateName string) []ValidationRe
 		colNum := 1
 
 		prefix := fmt.Sprintf("template: %s:", templateName)
-		if strings.HasPrefix(msg, prefix) {
-			msg = strings.TrimPrefix(msg, prefix)
+		if after, ok := strings.CutPrefix(msg, prefix); ok {
+			msg = after
 		} else if idx := strings.Index(msg, ": "); idx != -1 && strings.HasPrefix(msg, "template:") {
 			msg = msg[idx+2:]
 		}

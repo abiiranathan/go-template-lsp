@@ -21,10 +21,10 @@ import (
 // parseTemplateAction parses a {{template}} or {{block}} action to extract its arguments.
 func parseTemplateAction(action string) []string {
 	rest := action
-	if strings.HasPrefix(rest, "template ") {
-		rest = strings.TrimPrefix(rest, "template ")
-	} else if strings.HasPrefix(rest, "block ") {
-		rest = strings.TrimPrefix(rest, "block ")
+	if after, ok := strings.CutPrefix(rest, "template "); ok {
+		rest = after
+	} else if after, ok := strings.CutPrefix(rest, "block "); ok {
+		rest = after
 	}
 	rest = strings.TrimSpace(rest)
 

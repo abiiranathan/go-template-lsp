@@ -24,7 +24,10 @@ func resolvePartialScope(
 	}
 
 	resolved := resolveScopeFromExpression(contextArg, scopeStack, varMap, funcMaps)
-	if len(resolved.Fields) > 0 || (resolved.TypeStr != "" && resolved.TypeStr != "unknown") {
+	if len(resolved.Fields) > 0 {
+		return resolved
+	}
+	if resolved.TypeStr != "" && resolved.TypeStr != "unknown" && !isCollectionType(resolved.TypeStr) {
 		return resolved
 	}
 
@@ -41,10 +44,22 @@ func resolvePartialScope(
 		if scope.IsMap && scope.KeyType == "" {
 			scope.KeyType = unwrapMapKeyType(inferred.TypeStr)
 		}
-		return scope
+		if len(scope.Fields) > 0 || (scope.TypeStr != "" && scope.TypeStr != "unknown") {
+			return scope
+		}
 	}
 
 	return resolved
+}
+
+// isCollectionType reports whether typeStr is a slice or map type (optionally
+// behind a pointer). Collections resolved without fields — e.g. a registered
+// dict func returning map[string]interface{} — need expression inference to
+// recover their keys (dict "name" "x" ...), which resolveScopeFromExpression
+// cannot provide.
+func isCollectionType(typeStr string) bool {
+	trimmed := strings.TrimLeft(strings.TrimSpace(typeStr), "*")
+	return strings.HasPrefix(trimmed, "[]") || strings.HasPrefix(trimmed, "map[")
 }
 
 // buildPartialVarMap constructs the variable map available to a nested template

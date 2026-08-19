@@ -334,16 +334,26 @@ export class CompletionProvider {
                     }
 
                     if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
-                        fields = [...scopeVars.values()].map(v => ({
-                            name: v.name,
-                            type: v.type,
-                            fields: v.fields,
-                            isSlice: v.isSlice ?? false,
-                            doc: v.doc,
-                            isMap: v.isMap,
-                            keyType: v.keyType,
-                            elemType: v.elemType,
-                        } as FieldInfo));
+                        const rootDot = scopeVars.get('.');
+                        if (rootDot && (rootDot.fields?.length || rootDot.type)) {
+                            let rootFields = rootDot.fields ?? [];
+                            if (rootFields.length === 0 && rootDot.type) {
+                                const resolver = this.scope.buildFieldResolver(scopeVars, stack);
+                                rootFields = resolver(rootDot.type) ?? [];
+                            }
+                            fields = rootFields;
+                        } else {
+                            fields = [...scopeVars.values()].map(v => ({
+                                name: v.name,
+                                type: v.type,
+                                fields: v.fields,
+                                isSlice: v.isSlice ?? false,
+                                doc: v.doc,
+                                isMap: v.isMap,
+                                keyType: v.keyType,
+                                elemType: v.elemType,
+                            } as FieldInfo));
+                        }
                     }
 
                     this.addFieldsToCompletion(
@@ -373,17 +383,28 @@ export class CompletionProvider {
                 fields = resolver(dotFrame.typeStr) ?? [];
             }
 
+            // Fall back to a root "." variable (partial context) when no dot frame exists.
             if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
-                fields = [...scopeVars.values()].map(v => ({
-                    name: v.name,
-                    type: v.type,
-                    fields: v.fields,
-                    isSlice: v.isSlice ?? false,
-                    doc: v.doc,
-                    isMap: v.isMap,
-                    keyType: v.keyType,
-                    elemType: v.elemType,
-                } as FieldInfo));
+                const rootDot = scopeVars.get('.');
+                if (rootDot && (rootDot.fields?.length || rootDot.type)) {
+                    let rootFields = rootDot.fields ?? [];
+                    if (rootFields.length === 0 && rootDot.type) {
+                        const resolver = this.scope.buildFieldResolver(scopeVars, stack);
+                        rootFields = resolver(rootDot.type) ?? [];
+                    }
+                    fields = rootFields;
+                } else {
+                    fields = [...scopeVars.values()].map(v => ({
+                        name: v.name,
+                        type: v.type,
+                        fields: v.fields,
+                        isSlice: v.isSlice ?? false,
+                        doc: v.doc,
+                        isMap: v.isMap,
+                        keyType: v.keyType,
+                        elemType: v.elemType,
+                    } as FieldInfo));
+                }
             }
 
             this.addFieldsToCompletion({ fields }, completionItems, filterPrefix, repRange);

@@ -262,3 +262,21 @@ func extractFieldDoc(field *goast.Field) string {
 	}
 	return ""
 }
+
+// findEnclosingGenDecl finds the *ast.GenDecl in file that declares typeSpec.
+// This is needed because doc comments on grouped type declarations
+// (type ( Foo struct{} )) attach to the GenDecl, not the TypeSpec.
+func findEnclosingGenDecl(file *goast.File, target *goast.TypeSpec) (*goast.GenDecl, bool) {
+	for _, decl := range file.Decls {
+		genDecl, ok := decl.(*goast.GenDecl)
+		if !ok || genDecl.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range genDecl.Specs {
+			if spec == target {
+				return genDecl, true
+			}
+		}
+	}
+	return nil, false
+}

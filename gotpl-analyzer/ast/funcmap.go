@@ -40,6 +40,7 @@ func processFuncMapIndexAssign(
 
 	if rhsIdx < len(assign.Rhs) {
 		fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(rhs, info, fset)
+		fInfo.Doc = resolveFuncDoc(rhs, info, nil, fset)
 
 		if rtv, ok := info.Types[rhs]; ok && rtv.Type != nil {
 			seen := seenPool.get()
@@ -81,7 +82,7 @@ func extractFuncMaps(
 		fInfo := FuncMapInfo{Name: name}
 
 		fInfo.DefFile, fInfo.DefLine, fInfo.DefCol = resolveFuncDefLocation(kv.Value, info, fset)
-		fInfo.Doc = resolveFuncDoc(kv.Value, info, filesMap)
+		fInfo.Doc = resolveFuncDoc(kv.Value, info, filesMap, fset)
 
 		if info != nil {
 			if tv, ok := info.Types[kv.Value]; ok && tv.Type != nil {
@@ -192,8 +193,10 @@ func resolveFuncDefLocation(expr goast.Expr, info *types.Info, fset *token.FileS
 }
 
 // resolveFuncDoc attempts to extract documentation for a function value.
-// Only works for named functions, not anonymous literals.
-func resolveFuncDoc(expr goast.Expr, info *types.Info, filesMap map[string]*goast.File) string {
+// Only works for named functions, not anonymous literals. When the function
+// lives in an external (stdlib / module dependency) file not present in
+// filesMap, its doc is resolved from the source file on disk.
+func resolveFuncDoc(expr goast.Expr, info *types.Info, filesMap map[string]*goast.File, fset *token.FileSet) string {
 	if info == nil {
 		return ""
 	}
@@ -227,6 +230,12 @@ func resolveFuncDoc(expr goast.Expr, info *types.Info, filesMap map[string]*goas
 				return ""
 			}
 		}
+	}
+
+	// Not a project file — resolve the doc from the external source.
+	if fset != nil {
+		pos := fset.Position(obj.Pos())
+		return funcDocAt(pos.Filename, pos.Line)
 	}
 
 	return ""

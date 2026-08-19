@@ -1,7 +1,9 @@
 package validator_test
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/abiiranathan/go-template-lsp/gotpl-analyzer/ast"
@@ -165,5 +167,91 @@ func TestHoverOnQuotedStringLiteral(t *testing.T) {
 
 	if res.TypeStr != "string" {
 		t.Fatalf("expected string type for quoted literal, got %q (expression: %q)", res.TypeStr, res.Expression)
+	}
+}
+
+// TestHoverDocForExternalMethod verifies that hovering on a method of an
+// external type (e.g. time.Time.Format) surfaces the stdlib doc comment,
+// resolved end-to-end from the analyzer's type registry.
+func TestHoverDocForExternalMethod(t *testing.T) {
+	dir := t.TempDir()
+	writeModuleFile(t, filepath.Join(dir, "go.mod"), "module example.com/hover\n\ngo 1.21\n")
+	writeModuleFile(t, filepath.Join(dir, "main.go"), `package main
+
+import (
+	"time"
+)
+
+type Visit struct {
+	CreatedAt time.Time
+}
+
+func Render(w http.ResponseWriter, template string, data interface{}) {}
+
+func main() {
+	Render(nil, "test.html", map[string]interface{}{
+		"visit": Visit{},
+	})
+}
+`)
+
+	result := ast.AnalyzeDir(dir, "", &ast.DefaultConfig)
+	result.Flatten()
+
+	vars := make(map[string]ast.TemplateVar)
+	for _, rc := range result.RenderCalls {
+		for _, v := range rc.Vars {
+			vars[v.Name] = v
+		}
+	}
+	if len(vars) == 0 {
+		t.Fatal("expected render vars from analyzer")
+	}
+
+	content := `{{ .visit.CreatedAt.Format "2006-01-02" }}`
+
+	// Cursor on "Format" → sub-expression ".visit.CreatedAt.Format".
+	// col 26 lands on the final 't' of "Format".
+	res := validator.GetHoverResult(
+		content,
+		vars,
+		"test.html",
+		".", ".",
+		0,
+		1, 26,
+		nil, nil, result.Types,
+	)
+	if res == nil {
+		t.Fatal("expected hover result on .visit.CreatedAt.Format, got nil")
+	}
+	if res.TypeStr != "string" {
+		t.Errorf("expected Format to return string, got %q", res.TypeStr)
+	}
+	if !strings.Contains(res.Doc, "Format returns a textual representation") {
+		t.Errorf("expected Format doc in hover, got %q", res.Doc)
+	}
+
+	// Hover on another external method to confirm docs are not Format-specific.
+	res = validator.GetHoverResult(
+		`{{ .visit.CreatedAt.Date }}`,
+		vars,
+		"test.html",
+		".", ".",
+		0,
+		1, 23, // col 23 lands on the final 'e' of "Date"
+		nil, nil, result.Types,
+	)
+	if res == nil {
+		t.Fatal("expected hover result on .visit.CreatedAt.Date, got nil")
+	}
+	if !strings.Contains(res.Doc, "returns the year, month, and day in which t occurs") {
+		t.Errorf("expected Date doc in hover, got %q", res.Doc)
+	}
+}
+
+func writeModuleFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

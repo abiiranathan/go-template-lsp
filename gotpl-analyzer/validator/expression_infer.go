@@ -565,12 +565,16 @@ func (i expressionInferencer) resolveChainedField(base *ExpressionTypeResult, pa
 func (i expressionInferencer) normalizeFieldResult(field ast.FieldInfo) *ExpressionTypeResult {
 	if field.TypeStr == "method" && len(field.Returns) > 0 {
 		ret := field.Returns[0]
+		doc := field.Doc
+		if doc == "" {
+			doc = ret.Doc
+		}
 		return i.hydrateResult(&ExpressionTypeResult{
 			TypeStr: ret.TypeStr,
 			Fields:  ret.Fields,
 			Params:  field.Params,
 			Returns: field.Returns,
-			Doc:     ret.Doc,
+			Doc:     doc,
 		})
 	}
 

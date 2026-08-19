@@ -102,11 +102,20 @@ func extractFieldsUncachedDepth(
 	}
 
 	entry := structIndex[astKey]
+	doc := entry.doc
+	if doc == "" {
+		// Type lives outside the analyzed project — resolve its doc from source.
+		if obj := named.Obj(); obj != nil && obj.Pos().IsValid() && fset != nil {
+			pos := fset.Position(obj.Pos())
+			doc = typeDocAt(pos.Filename, pos.Line)
+		}
+	}
+
 	fields := extractStructFieldsDepth(strct, entry, structIndex, fc, seen, fset, depth)
 	fields = append(fields, extractMethodFields(named, structIndex, fc, seen, fset, depth)...)
 	addMethodDocs(fields, entry)
 
-	return fields, entry.doc
+	return fields, doc
 }
 
 // extractStructFieldsDepth processes all fields in a struct type with depth tracking.
@@ -258,6 +267,9 @@ func extractMethodFields(
 			fi.DefFile = position.Filename
 			fi.DefLine = position.Line
 			fi.DefCol = position.Column
+			if fi.Doc == "" {
+				fi.Doc = funcDocAt(position.Filename, position.Line)
+			}
 		}
 
 		fields = append(fields, fi)

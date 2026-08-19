@@ -666,30 +666,6 @@ export function resolvePath(
                 if (res.found) return res;
             }
         }
-        // Fall back to a root "." variable (e.g. partials invoked with a context
-        // argument like {{ template "footer.html" .visit }}) so the dot scope
-        // resolves even when the scope stack has no explicit dot frame.
-        const rootDot = vars.get('.');
-        if (rootDot) {
-            if (path.length === 1) {
-                return {
-                    typeStr: rootDot.type,
-                    found: true,
-                    fields: cleanFields(rootDot.fields),
-                    isMap: rootDot.isMap,
-                    keyType: rootDot.keyType,
-                    elemType: rootDot.elemType,
-                    isSlice: rootDot.isSlice,
-                    defFile: rootDot.defFile,
-                    defLine: rootDot.defLine,
-                    defCol: rootDot.defCol,
-                    doc: rootDot.doc,
-                };
-            }
-            const f = getFields(rootDot.type, rootDot.fields);
-            const res = resolveFieldsDeep(path.slice(1), f, fieldResolver);
-            if (res.found) return res;
-        }
         // If no dotFrame is found but path is just '.', still consider it found (global context)
         if (path.length === 1) {
             return { typeStr: 'context', found: true };

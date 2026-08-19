@@ -339,13 +339,15 @@ func validateNestedFields(fullExpr string, fieldParts []string, fields []ast.Fie
 				// Basic type or struct: use element type as parent type
 				parentType = currentElemType
 			}
-
 			continue
 		}
 
-		// ── Struct field access ────────────────────────────────────────────
-		// Field must exist in Fields slice, OR be a recognised method on the
-		// current parent type.
+		// ── SAFE SILENCE CHECK ──────────────────────────────────────────────
+		// If parent type is any/interface{}/unknown or has no field metadata,
+		// we cannot know if the field exists. Stay silent to avoid false errors.
+		if isIndeterminateType(parentType) && len(currentFields) == 0 {
+			return nil
+		}
 
 		found := false
 		var nextFields []ast.FieldInfo
@@ -364,12 +366,13 @@ func validateNestedFields(fullExpr string, fieldParts []string, fields []ast.Fie
 		}
 
 		if !found {
-			// ── Method resolution ──────────────────────────────────────────
+			// Check standard methods (String, Format, Error, etc.)
 			if typeHasMethod(parentType, fieldName) {
 				// Method is valid; the result type is opaque — stop validation.
 				return nil
 			}
 
+			// If current fields are empty and type is not a known concrete struct, stay silent
 			if len(currentFields) == 0 {
 				return nil
 			}
@@ -384,6 +387,21 @@ func validateNestedFields(fullExpr string, fieldParts []string, fields []ast.Fie
 	}
 
 	return nil
+}
+
+// isIndeterminateType reports true when a type cannot be strictly validated at compile time.
+func isIndeterminateType(t string) bool {
+	t = strings.TrimSpace(t)
+	for strings.HasPrefix(t, "*") {
+		t = strings.TrimPrefix(t, "*")
+	}
+	return t == "" ||
+		t == "any" ||
+		t == "interface{}" ||
+		t == "unknown" ||
+		t == "context" ||
+		strings.HasPrefix(t, "map[string]any") ||
+		strings.HasPrefix(t, "map[string]interface{}")
 }
 
 func undefinedVariableError(varExpr string) *ValidationResult {

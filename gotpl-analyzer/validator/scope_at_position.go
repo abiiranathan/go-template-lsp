@@ -399,7 +399,6 @@ func extractHoverExpression(action, first string) string {
 	case "end", "define":
 		return ""
 	case "block":
-		// The {{ block "name" .ctx }} line itself — extract the context arg
 		parts := parseTemplateAction("template " + strings.TrimSpace(strings.TrimPrefix(action, "block")))
 		if len(parts) >= 2 {
 			return parts[1]
@@ -436,16 +435,30 @@ func extractHoverExpression(action, first string) string {
 		if len(words) > 0 {
 			switch words[0] {
 			case "if":
-				return strings.TrimSpace(strings.TrimPrefix(rest, "if"))
+				expr := strings.TrimSpace(strings.TrimPrefix(rest, "if"))
+				_, pipeline, hasAssignment := splitAssignment(expr)
+				if hasAssignment {
+					return pipeline
+				}
+				return expr
 			case "with":
-				return strings.TrimSpace(strings.TrimPrefix(rest, "with"))
+				expr := strings.TrimSpace(strings.TrimPrefix(rest, "with"))
+				_, pipeline, hasAssignment := splitAssignment(expr)
+				if hasAssignment {
+					return pipeline
+				}
+				return expr
 			case "range":
-				return strings.TrimSpace(strings.TrimPrefix(rest, "range"))
+				expr := strings.TrimSpace(strings.TrimPrefix(rest, "range"))
+				_, pipeline, hasAssignment := splitAssignment(expr)
+				if hasAssignment {
+					return pipeline
+				}
+				return expr
 			}
 		}
 		return rest
 	default:
-		// Regular expression or assignment: use the whole action
 		return action
 	}
 }

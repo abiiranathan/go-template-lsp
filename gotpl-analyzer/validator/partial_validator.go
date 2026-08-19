@@ -9,14 +9,11 @@ import (
 	"github.com/abiiranathan/go-template-lsp/gotpl-analyzer/ast"
 )
 
-// validateTemplateCallWithRegistry is the hot-path implementation. It accepts
-// an already-merged registry and passes it directly into recursive
-// ValidateTemplateContent calls, breaking the re-merge cycle.
-//
-// The critical difference from the old validateTemplateCall: named block
-// validation calls validateTemplateContentWithRegistry (the internal variant)
-// instead of ValidateTemplateContent (the public variant), bypassing the
-// mergeNamedBlockRegistry call entirely since the registry is already current.
+// validateTemplateCallWithRegistry validates a {{ template "name" . }} or {{ block "name" . }} invocation.
+// It verifies:
+// 1. That the target template or named block actually exists (in registry or on disk).
+// 2. That the context argument expression is valid in the caller's scope.
+// 3. That the target template body is valid when evaluated against the passed context.
 func validateTemplateCallWithRegistry(
 	action string,
 	scopeStack []ScopeType,
@@ -42,7 +39,8 @@ func validateTemplateCallWithRegistry(
 		contextArg = parts[1]
 	}
 
-	if contextArg != "" && contextArg != "." {
+	// 1. Validate the context argument expression in the caller's current scope
+	if contextArg != "" && contextArg != "." && contextArg != "$" {
 		if err := validateContextArg(contextArg, scopeStack, varMap, funcMaps); err != nil {
 			err.Template = templateName
 			err.Line = actualLineNum
@@ -60,8 +58,6 @@ func validateTemplateCallWithRegistry(
 				tmplName, e.Template, e.Message,
 			)
 			if e.Template != templateName {
-				// Preserve the original error location so the editor can
-				// navigate directly to the source of the bug.
 				e.SourceTemplate = e.Template
 				e.SourceLine = e.Line
 				e.SourceColumn = e.Column
@@ -73,13 +69,13 @@ func validateTemplateCallWithRegistry(
 		return inner
 	}
 
+	// 2. Case A: Target is a named block defined across the project
 	if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
 		anyValid := false
 		allErrors := make([]ValidationResult, 0)
 		for _, nt := range entries {
 			partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
 			partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
-			// Use the internal variant — registry is already merged, skip re-merge.
 			partialErrors := validateTemplateContentWithRegistry(
 				nt.Content,
 				partialVarMap,
@@ -87,7 +83,7 @@ func validateTemplateCallWithRegistry(
 				baseDir,
 				templateRoot,
 				nt.Line,
-				registry, // pass through unchanged
+				registry,
 				funcMaps,
 			)
 			if len(partialErrors) == 0 {
@@ -98,21 +94,29 @@ func validateTemplateCallWithRegistry(
 		if !anyValid {
 			errors = append(errors, allErrors...)
 		}
+		return errors
+	}
 
-	} else if IsFileBasedPartial(tmplName) {
-		fullPath := filepath.Join(baseDir, templateRoot, tmplName)
-		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
-			errors = append(errors, ValidationResult{
-				Template: templateName,
-				Line:     actualLineNum,
-				Column:   col,
-				Variable: tmplName,
-				Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, fullPath),
-				Severity: "error",
-			})
-			return errors
+	// 3. Case B: Target is a file on disk (e.g. "partials/header.html" or "partials/header")
+	candidates := []string{
+		filepath.Join(baseDir, templateRoot, tmplName),
+		filepath.Join(baseDir, templateRoot, tmplName+".html"),
+		filepath.Join(baseDir, templateRoot, tmplName+".tmpl"),
+		filepath.Join(baseDir, templateRoot, tmplName+".tpl"),
+		filepath.Join(baseDir, templateRoot, tmplName+".gohtml"),
+	}
+
+	var fullPath string
+	foundFile := false
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			foundFile = true
+			fullPath = candidate
+			break
 		}
+	}
 
+	if foundFile {
 		partialScope := resolvePartialScope(contextArg, scopeStack, varMap, funcMaps)
 		partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
 
@@ -122,11 +126,29 @@ func validateTemplateCallWithRegistry(
 			tmplName,
 			baseDir,
 			templateRoot,
-			registry, // pass through — ValidateTemplateFile already handles merge
+			registry,
 			funcMaps,
 		)
 		errors = append(errors, pinCallSite(partialErrors)...)
+		return errors
 	}
+
+	// 4. Case C: Target does NOT exist anywhere -> Report error!
+	nameCol := col
+	if idx := strings.Index(action, `"`+tmplName+`"`); idx != -1 {
+		nameCol = col + idx + 1 // Point inside the quotes
+	} else if idx := strings.Index(action, tmplName); idx != -1 {
+		nameCol = col + idx
+	}
+
+	errors = append(errors, ValidationResult{
+		Template: templateName,
+		Line:     actualLineNum,
+		Column:   nameCol,
+		Variable: tmplName,
+		Message:  fmt.Sprintf(`Template or named block %q is not defined (not found as a template file or {{ define %q }})`, tmplName, tmplName),
+		Severity: "error",
+	})
 
 	return errors
 }

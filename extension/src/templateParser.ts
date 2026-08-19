@@ -20,17 +20,22 @@ export class TemplateParser {
             return cached;
         }
 
-        const tokens = this.tokenize(content);
-        const { nodes } = this.buildTree(tokens, 0);
+        try {
+            const tokens = this.tokenize(content);
+            const { nodes } = this.buildTree(tokens, 0);
 
-        if (TemplateParser.parseCache.size >= TemplateParser.MAX_CACHE_SIZE) {
-            const firstKey = TemplateParser.parseCache.keys().next().value;
-            if (firstKey !== undefined) {
-                TemplateParser.parseCache.delete(firstKey);
+            if (TemplateParser.parseCache.size >= TemplateParser.MAX_CACHE_SIZE) {
+                const firstKey = TemplateParser.parseCache.keys().next().value;
+                if (firstKey !== undefined) {
+                    TemplateParser.parseCache.delete(firstKey);
+                }
             }
+            TemplateParser.parseCache.set(content, nodes);
+            return nodes;
+        } catch {
+            // Graceful fallback for incomplete/broken syntax during typing
+            return [];
         }
-        TemplateParser.parseCache.set(content, nodes);
-        return nodes;
     }
 
     // ── Tokenizer ──────────────────────────────────────────────────────────────

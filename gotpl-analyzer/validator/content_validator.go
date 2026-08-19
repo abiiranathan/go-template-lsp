@@ -53,10 +53,18 @@ func ValidateTemplateContent(
 	funcMaps ...FuncMapRegistry,
 ) []ValidationResult {
 	effectiveFuncMaps := optionalFuncMapRegistry(funcMaps...)
-	// Merge once at the entry point. All recursive calls receive this merged
-	// registry directly and skip the merge entirely.
+
+	// Step 1: Run complete Go template parser to catch syntax, unclosed blocks, unknown funcs & arity
+	syntaxErrors, _ := ValidateTemplateSyntax(content, templateName, effectiveFuncMaps)
+	if len(syntaxErrors) > 0 {
+		return syntaxErrors
+	}
+
+	// Step 2: Run semantic variable and field access validation
 	effectiveRegistry := mergeNamedBlockRegistry(registry, content, templateName)
-	return validateTemplateContentWithRegistry(content, varMap, templateName, baseDir, templateRoot, lineOffset, effectiveRegistry, effectiveFuncMaps)
+	return validateTemplateContentWithRegistry(
+		content, varMap, templateName, baseDir, templateRoot, lineOffset, effectiveRegistry, effectiveFuncMaps,
+	)
 }
 
 // validateTemplateContentWithRegistry is the internal implementation that

@@ -9,16 +9,17 @@ import (
 	templateparse "text/template/parse"
 )
 
-// Regex patterns to normalize `else with` and `else range` for Go's standard parser
-// while maintaining exact 1:1 byte lengths for diagnostic offsets.
-// "with " (5 bytes)  -> "if   " (5 bytes)
-// "range " (6 bytes) -> "if    " (6 bytes)
 var (
-	elseWithRe  = regexp.MustCompile(`(\{\{-?\s*else\s+)with(\s+)`)
-	elseRangeRe = regexp.MustCompile(`(\{\{-?\s*else\s+)range(\s+)`)
+	// Matches {{ else with ... }} and {{ else range ... }}, capturing the keyword
+	// and the trailing expression.
+	elseBranchRe = regexp.MustCompile(`\{\{-?\s*else\s+(with|range)([\s\S]*?)-?\}\}`)
+	// Matches opening {{ with ... }} and {{ range ... }} block actions so they can
+	// be normalized to {{ if ... }} (Go's parser only accepts else-if chains after if).
+	withRangeOpenRe = regexp.MustCompile(`\{\{-?\s*(with|range)([\s\S]*?)-?\}\}`)
+	// Matches {{ define ... }} inside commands
+	nestedDefineRe = regexp.MustCompile(`\{\{-?\s*define\s+["']([^"']+)["']\s*-?\}\}`)
 )
 
-// Common template helper functions recognized across popular Go frameworks (Sprig, etc.)
 var commonTemplateHelpers = map[string]bool{
 	"dict":         true,
 	"add":          true,
@@ -34,12 +35,6 @@ var commonTemplateHelpers = map[string]bool{
 	"toPrettyJson": true,
 }
 
-// ValidateTemplateSyntax uses Go's official text/template parser to detect:
-// - Syntax errors
-// - Unclosed actions ({{ without }})
-// - Unclosed/misplaced blocks (including {{ else with }}, {{ else range }}, {{ else if }})
-// - Unknown functions not present in builtins or FuncMap
-// - Function arity (argument counts)
 func ValidateTemplateSyntax(
 	content string,
 	templateName string,
@@ -49,7 +44,6 @@ func ValidateTemplateSyntax(
 
 	funcs := template.FuncMap{}
 
-	// 1. Register built-ins and helpers
 	for name := range templateBuiltins {
 		funcs[name] = func(...any) any { return nil }
 	}
@@ -57,16 +51,24 @@ func ValidateTemplateSyntax(
 		funcs[name] = func(...any) any { return nil }
 	}
 
-	// 2. Register all user-defined functions discovered from Go source
 	for name := range funcMaps {
 		funcs[name] = func(...any) any { return nil }
 	}
 
-	// 3. Normalize `else with` and `else range` for standard text/template parser
-	normalizedContent := normalizeElseBranches(content)
+	normalizedContent := normalizeForSyntaxParser(content)
 
-	// 4. Parse using standard text/template/parse
 	trees, err := templateparse.Parse(templateName, normalizedContent, "{{", "}}", funcs)
+
+	// If funcMaps is nil (dynamic/unspecified), auto-stub undefined functions so syntax parser only checks structure
+	for funcMaps == nil && err != nil && strings.Contains(err.Error(), "function") && strings.Contains(err.Error(), "not defined") {
+		missingFunc := extractMissingFuncName(err.Error())
+		if missingFunc == "" || funcs[missingFunc] != nil {
+			break
+		}
+		funcs[missingFunc] = func(...any) any { return nil }
+		trees, err = templateparse.Parse(templateName, normalizedContent, "{{", "}}", funcs)
+	}
+
 	if err != nil {
 		results = append(results, parseTemplateSyntaxError(err.Error(), templateName)...)
 		return results, nil
@@ -80,27 +82,104 @@ func ValidateTemplateSyntax(
 		}
 	}
 
-	// 5. Validate function argument counts (Arity) if tree parsed successfully
-	if tree != nil && tree.Root != nil {
+	if tree != nil && tree.Root != nil && funcMaps != nil {
 		results = append(results, validateTreeFunctionArity(tree.Root, templateName, content, funcMaps)...)
 	}
 
 	return results, tree
 }
 
-// normalizeElseBranches replaces `else with` and `else range` with byte-identical
-// `else if` tokens so the standard library parser parses the tree without error,
-// preserving exact line and column numbers.
-func normalizeElseBranches(content string) string {
-	if !strings.Contains(content, "else") {
-		return content
+func extractMissingFuncName(errStr string) string {
+	idx := strings.Index(errStr, `function "`)
+	if idx == -1 {
+		return ""
 	}
+	start := idx + len(`function "`)
+	end := strings.IndexByte(errStr[start:], '"')
+	if end == -1 {
+		return ""
+	}
+	return errStr[start : start+end]
+}
 
-	// Replace "with " (5 bytes) with "if   " (5 bytes)
-	normalized := elseWithRe.ReplaceAllString(content, "${1}if  ${2}")
+// normalizeForSyntaxParser normalizes Go 1.22+ features (else with, else range, nested defines)
+// into byte-length-identical constructs for text/template/parse so that syntax, nesting, and
+// offsets remain exact for line/column reporting purposes.
+func normalizeForSyntaxParser(content string) string {
+	normalized := content
 
-	// Replace "range " (6 bytes) with "if    " (6 bytes)
-	normalized = elseRangeRe.ReplaceAllString(normalized, "${1}if   ${2}")
+	// Normalize {{ else with/range EXPR }} -> {{ else if EXPR }}  (space-padded to same length).
+	// The expression is preserved so variable assignments like $x := .Foo stay visible to the parser.
+	normalized = elseBranchRe.ReplaceAllStringFunc(normalized, func(match string) string {
+		sub := elseBranchRe.FindStringSubmatch(match)
+		if len(sub) != 3 {
+			return match
+		}
+		dash := ""
+		if strings.HasPrefix(match, "{{-") {
+			dash = "-"
+		}
+		endDash := ""
+		if strings.HasSuffix(match, "-}}") {
+			endDash = "-"
+		}
+
+		// "else with" -> "else if"; pad with spaces to compensate for the shorter keyword.
+		kw := sub[1]
+		rest := sub[2]
+
+		return "{{" + dash + " else if" + strings.Repeat(" ", len(kw)-2) + rest + endDash + "}}"
+	})
+
+	// Normalize opening {{ with/range EXPR }} -> {{ if EXPR }} so any {{ else if }}
+	// chain introduced above parses correctly (with/range do not accept else-if in Go).
+	normalized = withRangeOpenRe.ReplaceAllStringFunc(normalized, func(match string) string {
+		sub := withRangeOpenRe.FindStringSubmatch(match)
+		if len(sub) != 3 {
+			return match
+		}
+		dash := ""
+		if strings.HasPrefix(match, "{{-") {
+			dash = "-"
+		}
+		endDash := ""
+		if strings.HasSuffix(match, "-}}") {
+			endDash = "-"
+		}
+
+		expr := strings.TrimSpace(sub[2])
+		// "with $x := pipeline" / "range $i, $v := pipeline": keep only the pipeline.
+		// Declarations are tracked by the semantic validator, not the syntax parser.
+		if idx := strings.Index(expr, ":="); idx != -1 {
+			expr = strings.TrimSpace(expr[idx+2:])
+		}
+
+		head := "{{" + dash + " if "
+		tail := endDash + "}}"
+
+		pad := max(len(match)-len(head)-len(expr)-len(tail), 1)
+
+		return head + expr + strings.Repeat(" ", pad) + tail
+	})
+
+	// Normalize {{ define "name" }} -> {{ if true }}  (space-padded to same length)
+	normalized = nestedDefineRe.ReplaceAllStringFunc(normalized, func(match string) string {
+		dash := ""
+		if strings.HasPrefix(match, "{{-") {
+			dash = "-"
+		}
+		endDash := ""
+		if strings.HasSuffix(match, "-}}") {
+			endDash = "-"
+		}
+
+		head := "{{" + dash + " if true"
+		tail := endDash + "}}"
+
+		pad := max(len(match)-len(head)-len(tail), 1)
+
+		return head + strings.Repeat(" ", pad) + tail
+	})
 
 	return normalized
 }
@@ -121,13 +200,12 @@ func parseTemplateSyntaxError(errStr string, templateName string) []ValidationRe
 		colNum := 1
 
 		prefix := fmt.Sprintf("template: %s:", templateName)
-		if after, ok := strings.CutPrefix(msg, prefix); ok {
-			msg = after
+		if strings.HasPrefix(msg, prefix) {
+			msg = strings.TrimPrefix(msg, prefix)
 		} else if idx := strings.Index(msg, ": "); idx != -1 && strings.HasPrefix(msg, "template:") {
 			msg = msg[idx+2:]
 		}
 
-		// Extract line and optional col
 		parts := strings.SplitN(msg, ":", 3)
 		if len(parts) >= 2 {
 			if l, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
@@ -145,10 +223,26 @@ func parseTemplateSyntaxError(errStr string, templateName string) []ValidationRe
 			}
 		}
 
+		// Undefined variables are reported by the semantic validator with better
+		// precision (full expression path and correct scope tracking), so skip them here.
+		if strings.Contains(msg, "undefined variable") {
+			continue
+		}
+
+		varName := ""
+		if strings.Contains(msg, `function "`) {
+			varName = extractMissingFuncName(msg)
+		} else if strings.Contains(msg, `undefined variable: `) {
+			idx := strings.Index(msg, `undefined variable: `)
+			varName = strings.TrimSpace(msg[idx+len(`undefined variable: `):])
+			msg = fmt.Sprintf("Template variable %q is not defined in the current scope", varName)
+		}
+
 		results = append(results, ValidationResult{
 			Template: templateName,
 			Line:     lineNum,
 			Column:   colNum,
+			Variable: varName,
 			Message:  fmt.Sprintf("Syntax error: %s", msg),
 			Severity: "error",
 		})
@@ -242,9 +336,8 @@ func validatePipeArity(
 		}
 
 		expectedCount := len(fn.Params)
-		actualArgs := len(cmd.Args) - 1 // first arg is the function name itself
+		actualArgs := len(cmd.Args) - 1
 
-		// In a pipeline (stage > 0), the piped value is the final argument
 		if cmdIdx > 0 {
 			actualArgs++
 		}

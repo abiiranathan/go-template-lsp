@@ -184,15 +184,15 @@ func TestValidateTemplateContent(t *testing.T) {
 		// --- Named block discrimination ---
 		{
 			name:    "Named block template call is not resolved as a file",
-			content: `{{ template "content" . }}`,
+			content: `{{ block "content" . }}{{ end }}{{ template "content" . }}`,
 		},
 		{
 			name:    "Named block with dot-only context is not resolved as a file",
-			content: `{{ template "sidebar" . }}`,
+			content: `{{ block "sidebar" . }}{{ end }}{{ template "sidebar" . }}`,
 		},
 		{
 			name:    "Named block with variable context skips file resolution but validates var",
-			content: `{{ template "header" .User }}`,
+			content: `{{ block "header" .User }}{{ end }}{{ template "header" .User }}`,
 		},
 		{
 			name:            "Named block with invalid variable context still validates the variable",
@@ -209,7 +209,7 @@ func TestValidateTemplateContent(t *testing.T) {
 		},
 		{
 			name:    "Dot passed to template is valid",
-			content: `{{ template "block" . }}`,
+			content: `{{ block "block" . }}{{ end }}{{ template "block" . }}`,
 		},
 
 		// --- if/else (no scope change) ---

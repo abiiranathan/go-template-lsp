@@ -11,6 +11,8 @@ import (
 // for a nested template call.
 // resolvePartialScope determines what scope/type the context argument refers to
 // for a nested template call.
+// resolvePartialScope determines what scope/type the context argument refers to
+// for a nested template or block call.
 func resolvePartialScope(
 	contextArg string,
 	scopeStack []ScopeType,
@@ -19,6 +21,11 @@ func resolvePartialScope(
 ) ScopeType {
 	if contextArg == "" || contextArg == "." || contextArg == "$" {
 		return resolveScopeFromExpression(contextArg, scopeStack, varMap, funcMaps)
+	}
+
+	resolved := resolveScopeFromExpression(contextArg, scopeStack, varMap, funcMaps)
+	if len(resolved.Fields) > 0 || (resolved.TypeStr != "" && resolved.TypeStr != "unknown") {
+		return resolved
 	}
 
 	inferred := InferExpressionType(contextArg, varMap, scopeStack, nil, funcMaps, nil)
@@ -31,14 +38,13 @@ func resolvePartialScope(
 			KeyType:  inferred.KeyType,
 			ElemType: inferred.ElemType,
 		}
-		// Ensure KeyType is populated for map[string]any results (e.g. dict).
-		// InferExpressionType may leave KeyType empty when TypeStr encodes it.
 		if scope.IsMap && scope.KeyType == "" {
 			scope.KeyType = unwrapMapKeyType(inferred.TypeStr)
 		}
 		return scope
 	}
-	return resolveScopeFromExpression(contextArg, scopeStack, varMap, funcMaps)
+
+	return resolved
 }
 
 // buildPartialVarMap constructs the variable map available to a nested template

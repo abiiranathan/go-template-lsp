@@ -62,9 +62,7 @@ func ValidateTemplateContent(
 
 	// Step 2: Run semantic variable and field access validation
 	effectiveRegistry := mergeNamedBlockRegistry(registry, content, templateName)
-	return validateTemplateContentWithRegistry(
-		content, varMap, templateName, baseDir, templateRoot, lineOffset, effectiveRegistry, effectiveFuncMaps,
-	)
+	return validateTemplateContentWithRegistry(content, varMap, templateName, baseDir, templateRoot, lineOffset, effectiveRegistry, effectiveFuncMaps)
 }
 
 // validateTemplateContentWithRegistry is the internal implementation that
@@ -225,14 +223,51 @@ func validateTemplateContentWithRegistry(
 		})
 
 		if first == "block" {
-			syntheticAction := "template " + strings.TrimSpace(strings.TrimPrefix(action, "block"))
-			parts := parseTemplateAction(syntheticAction)
+			parts := parseTemplateAction(action)
 			if len(parts) >= 2 {
+				contextArg := parts[1]
+				// Validate that the context passed to {{ block "name" context }} is valid in current scope
+				if contextArg != "" && contextArg != "." && contextArg != "$" {
+					if err := validateContextArg(contextArg, scopeStack, varMap, effectiveFuncMaps); err != nil {
+						err.Template = templateName
+						err.Line = actualLineNum
+						err.Column = max(col+strings.Index(action, contextArg), col)
+						errors = append(errors, *err)
+					}
+				}
+			}
+
+			// Validate the block's own inline body (and any external overrides) against
+			// the context passed to this block. If a {{ template "blockName" }} call exists
+			// in the content, that call already validates every registry entry, so skip
+			// the inline entry here to avoid duplicate diagnostics.
+			if len(parts) >= 1 {
 				blockName := parts[0]
-				if !hasTemplateCallForBlock(content, blockName) {
-					// Pass effectiveRegistry directly — no re-merge.
-					partialErrs := validateTemplateCallWithRegistry(syntheticAction, scopeStack, varMap, actualLineNum, col, templateName, baseDir, templateRoot, effectiveRegistry, effectiveFuncMaps)
-					errors = append(errors, partialErrs...)
+				contextArg := "."
+				if len(parts) >= 2 {
+					contextArg = parts[1]
+				}
+
+				if entries, ok := effectiveRegistry[blockName]; ok {
+					for _, nt := range entries {
+						isInline := nt.TemplatePath == templateName && nt.Line == actualLineNum
+						if isInline && hasTemplateCallForBlock(content, blockName) {
+							continue
+						}
+						partialScope := resolvePartialScope(contextArg, scopeStack, varMap, effectiveFuncMaps)
+						partialVarMap := buildPartialVarMap(contextArg, partialScope, scopeStack, varMap)
+						partialErrors := validateTemplateContentWithRegistry(
+							nt.Content,
+							partialVarMap,
+							nt.TemplatePath,
+							baseDir,
+							templateRoot,
+							nt.Line,
+							effectiveRegistry,
+							effectiveFuncMaps,
+						)
+						errors = append(errors, partialErrors...)
+					}
 				}
 			}
 		}

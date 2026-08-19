@@ -69,7 +69,7 @@ func validateTemplateCallWithRegistry(
 		return inner
 	}
 
-	// 2. Case A: Target is a named block defined across the project
+	// 1. Registered named block
 	if entries, ok := registry[tmplName]; ok && len(entries) > 0 {
 		anyValid := false
 		allErrors := make([]ValidationResult, 0)
@@ -97,12 +97,11 @@ func validateTemplateCallWithRegistry(
 		return errors
 	}
 
-	// 3. Case B: Target is a file on disk (e.g. "partials/header.html" or "partials/header")
+	// 2. File on disk
 	candidates := []string{
 		filepath.Join(baseDir, templateRoot, tmplName),
 		filepath.Join(baseDir, templateRoot, tmplName+".html"),
 		filepath.Join(baseDir, templateRoot, tmplName+".tmpl"),
-		filepath.Join(baseDir, templateRoot, tmplName+".tpl"),
 		filepath.Join(baseDir, templateRoot, tmplName+".gohtml"),
 	}
 
@@ -133,10 +132,9 @@ func validateTemplateCallWithRegistry(
 		return errors
 	}
 
-	// 4. Case C: Target does NOT exist anywhere -> Report error!
 	nameCol := col
 	if idx := strings.Index(action, `"`+tmplName+`"`); idx != -1 {
-		nameCol = col + idx + 1 // Point inside the quotes
+		nameCol = col + idx + 1
 	} else if idx := strings.Index(action, tmplName); idx != -1 {
 		nameCol = col + idx
 	}
@@ -146,7 +144,7 @@ func validateTemplateCallWithRegistry(
 		Line:     actualLineNum,
 		Column:   nameCol,
 		Variable: tmplName,
-		Message:  fmt.Sprintf(`Template or named block %q is not defined (not found as a template file or {{ define %q }})`, tmplName, tmplName),
+		Message:  fmt.Sprintf(`Partial template "%s" could not be found at %s`, tmplName, filepath.Join(baseDir, templateRoot, tmplName)),
 		Severity: "error",
 	})
 

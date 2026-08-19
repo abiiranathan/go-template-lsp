@@ -495,7 +495,7 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 				File:     "template-call",
 				Line:     1,
 				Template: tplName,
-				Vars:     vars,
+				Vars:     copyTemplateVars(vars),
 			})
 		}
 	}
@@ -537,6 +537,12 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 	d.state.Store(snap)
 
 	return output, nil
+}
+
+func copyTemplateVars(vars []ast.TemplateVar) []ast.TemplateVar {
+	out := make([]ast.TemplateVar, len(vars))
+	copy(out, vars)
+	return out
 }
 
 func mergeVarSlices(a, b []ast.TemplateVar) []ast.TemplateVar {

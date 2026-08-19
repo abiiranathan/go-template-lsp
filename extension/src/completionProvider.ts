@@ -334,16 +334,24 @@ export class CompletionProvider {
                     }
 
                     if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
-                        fields = [...scopeVars.values()].map(v => ({
-                            name: v.name,
-                            type: v.type,
-                            fields: v.fields,
-                            isSlice: v.isSlice ?? false,
-                            doc: v.doc,
-                            isMap: v.isMap,
-                            keyType: v.keyType,
-                            elemType: v.elemType,
-                        } as FieldInfo));
+                        const dotVar = scopeVars.get('.');
+                        if (dotVar) {
+                            const resolver = this.scope.buildFieldResolver(scopeVars, stack);
+                            fields = (dotVar.fields && dotVar.fields.length > 0)
+                                ? dotVar.fields
+                                : (resolver(dotVar.type) ?? []);
+                        } else {
+                            fields = [...scopeVars.values()].map(v => ({
+                                name: v.name,
+                                type: v.type,
+                                fields: v.fields,
+                                isSlice: v.isSlice ?? false,
+                                doc: v.doc,
+                                isMap: v.isMap,
+                                keyType: v.keyType,
+                                elemType: v.elemType,
+                            } as FieldInfo));
+                        }
                     }
 
                     this.addFieldsToCompletion(
@@ -374,16 +382,24 @@ export class CompletionProvider {
             }
 
             if (!dotFrame || (!fields && dotFrame.typeStr === 'context')) {
-                fields = [...scopeVars.values()].map(v => ({
-                    name: v.name,
-                    type: v.type,
-                    fields: v.fields,
-                    isSlice: v.isSlice ?? false,
-                    doc: v.doc,
-                    isMap: v.isMap,
-                    keyType: v.keyType,
-                    elemType: v.elemType,
-                } as FieldInfo));
+                const dotVar = scopeVars.get('.');
+                if (dotVar) {
+                    const resolver = this.scope.buildFieldResolver(scopeVars, stack);
+                    fields = (dotVar.fields && dotVar.fields.length > 0)
+                        ? dotVar.fields
+                        : (resolver(dotVar.type) ?? []);
+                } else {
+                    fields = [...scopeVars.values()].map(v => ({
+                        name: v.name,
+                        type: v.type,
+                        fields: v.fields,
+                        isSlice: v.isSlice ?? false,
+                        doc: v.doc,
+                        isMap: v.isMap,
+                        keyType: v.keyType,
+                        elemType: v.elemType,
+                    } as FieldInfo));
+                }
             }
 
             this.addFieldsToCompletion({ fields }, completionItems, filterPrefix, repRange);

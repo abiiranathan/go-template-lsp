@@ -100,7 +100,7 @@ export class DefinitionProvider {
             }
         }
 
-        if (targetPath.length > 1) {
+        if (targetPath.length >= 1) {
             const subResult = resolvePath(
                 targetPath, hitVars, stack, hitLocals,
                 this.scope.buildFieldResolver(hitVars, stack)
@@ -119,8 +119,6 @@ export class DefinitionProvider {
                         );
                     }
                 }
-                // Path resolved successfully to a valid field or method, but has no defFile
-                // (e.g. stdlib methods like .Format). Do NOT fall through to the RenderCall fallback!
                 return null;
             }
         }
@@ -468,6 +466,17 @@ export class DefinitionProvider {
             }
             return this.navigateToFieldDefinition(searchPath, fields, ctx, scopeStack);
         }
+
+        const dotVar = vars.get('.');
+        if (dotVar) {
+            let fields = dotVar.fields ?? [];
+            if (fields.length === 0 && dotVar.type) {
+                const resolver = this.scope.buildFieldResolver(vars, scopeStack);
+                fields = resolver(dotVar.type) ?? [];
+            }
+            return this.navigateToFieldDefinition(searchPath, fields, ctx, scopeStack);
+        }
+
         return null;
     }
 

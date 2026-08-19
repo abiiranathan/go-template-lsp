@@ -576,6 +576,9 @@ function unwrapVar(
 /**
  * Resolve a dot-path against the current variable context and scope stack.
  */
+/**
+ * Resolve a dot-path against the current variable context and scope stack.
+ */
 export function resolvePath(
     path: string[],
     vars: Map<string, TemplateVar>,
@@ -595,7 +598,6 @@ export function resolvePath(
         if (path[0] === 'nil') {
             return { typeStr: 'any', found: true };
         }
-
         if (!isNaN(Number(path[0]))) {
             return { typeStr: 'float64', found: true };
         }
@@ -611,7 +613,7 @@ export function resolvePath(
         return fieldResolver(bare) || [];
     };
 
-    // Check blockLocals first for $ variables
+    // 1. Check blockLocals & frame locals for $ variables
     if (path[0].startsWith('$') && path[0] !== '$') {
         let local = blockLocals?.get(path[0]);
         if (!local) {
@@ -630,7 +632,7 @@ export function resolvePath(
                 return {
                     typeStr: local.type,
                     found: true,
-                    fields: cleanFields(local.fields),
+                    fields: cleanFields(local.fields) ?? fieldResolver?.(extractBareType(local.type)),
                     isSlice: info.isSlice,
                     isMap: info.isMap,
                     elemType: info.elemType,
@@ -646,7 +648,7 @@ export function resolvePath(
         }
     }
 
-    // Bare dot → current scope
+    // 2. Bare dot → current scope or root "." variable
     if (path[0] === '.') {
         const frame = findDotFrame(scopeStack);
         if (frame) {
@@ -654,34 +656,69 @@ export function resolvePath(
                 return {
                     typeStr: frame.typeStr,
                     found: true,
-                    fields: cleanFields(frame.fields),
+                    fields: cleanFields(frame.fields) ?? fieldResolver?.(extractBareType(frame.typeStr)),
                     isMap: frame.isMap,
                     keyType: frame.keyType,
                     elemType: frame.elemType,
                     isSlice: frame.isSlice,
                 };
-            } else { // Handle paths like ".key.subkey"
+            } else {
                 const f = getFields(frame.typeStr, frame.fields);
                 const res = resolveFieldsDeep(path.slice(1), f, fieldResolver);
                 if (res.found) return res;
             }
         }
-        // If no dotFrame is found but path is just '.', still consider it found (global context)
+
+        // If no dotFrame in scopeStack, check if root vars has '.' (e.g. footer.html passed .visit)
+        const dotVar = vars.get('.');
+        if (dotVar) {
+            const unwrapped = unwrapVar(dotVar, fieldResolver);
+            const info = extractTypeInfo(unwrapped.type, unwrapped.isSlice, unwrapped.isMap, unwrapped.elemType);
+            const f = getFields(unwrapped.type, unwrapped.fields);
+            if (path.length === 1) {
+                return {
+                    typeStr: unwrapped.type,
+                    found: true,
+                    fields: cleanFields(f),
+                    isSlice: info.isSlice,
+                    isMap: info.isMap,
+                    elemType: info.elemType,
+                    keyType: unwrapped.keyType,
+                    defFile: unwrapped.defFile,
+                    defLine: unwrapped.defLine,
+                    defCol: unwrapped.defCol,
+                    doc: unwrapped.doc,
+                };
+            } else {
+                const res = resolveFieldsDeep(path.slice(1), f, fieldResolver);
+                if (res.found) return res;
+            }
+        }
+
         if (path.length === 1) {
             return { typeStr: 'context', found: true };
         }
         return { typeStr: 'unknown', found: false };
     }
 
-    // Root context "$" — exposes all top-level vars
+    // 3. Root context "$" — exposes all top-level vars
     if (path[0] === '$' && path.length === 1) {
         return { typeStr: 'context', found: true };
     }
 
-    // Root-anchored path "$." → resolve against root vars, bypassing scope stack
+    // 4. Root-anchored path "$." → resolve against root vars, bypassing active scope stack
     if (path[0] === '$') {
         const remaining = path.slice(1);
         let topVar = vars.get(remaining[0]);
+
+        // If not found as a top-level var name, check if root vars has '.' context
+        if (!topVar && vars.has('.')) {
+            const dotVar = unwrapVar(vars.get('.')!, fieldResolver);
+            const f = getFields(dotVar.type, dotVar.fields);
+            const res = resolveFieldsDeep(remaining, f, fieldResolver);
+            if (res.found) return res;
+        }
+
         if (!topVar) return { typeStr: 'unknown', found: false };
 
         topVar = unwrapVar(topVar, fieldResolver);
@@ -691,7 +728,7 @@ export function resolvePath(
             return {
                 typeStr: topVar.type,
                 found: true,
-                fields: cleanFields(topVar.fields),
+                fields: cleanFields(topVar.fields) ?? fieldResolver?.(extractBareType(topVar.type)),
                 isSlice: info.isSlice,
                 isMap: info.isMap,
                 elemType: info.elemType,
@@ -706,15 +743,10 @@ export function resolvePath(
         return resolveFields(remaining.slice(1), f, info.isMap, info.elemType, info.isSlice, fieldResolver);
     }
 
-    // Path inside a with/range scope → check the active dot frame first.
+    // 5. Path inside an active with/range scope frame
     const dotFrame = findDotFrame(scopeStack);
     if (dotFrame) {
         if (dotFrame.isMap) {
-            // If the map has explicit typed fields (e.g. produced by a `dict` call),
-            // resolve against the specific key's declared type rather than the generic
-            // element type.  This is what makes `.diagnosis.ID` work inside a block
-            // called with `dict "diagnosis" .` — without this, every key resolves to
-            // `unknown` and intellisense / validation break for all sub-fields.
             const knownField = dotFrame.fields?.find(f => f.name === path[0]);
             if (knownField) {
                 const unwrapped = unwrapField(knownField, fieldResolver);
@@ -724,9 +756,7 @@ export function resolvePath(
                     return {
                         typeStr: unwrapped.type,
                         found: true,
-                        // Prefer inline fields; fall back to the type registry so that
-                        // struct types returned from dict values are fully explorable.
-                        fields: cleanFields(unwrapped.fields) ?? fieldResolver?.(unwrapped.type),
+                        fields: cleanFields(unwrapped.fields) ?? fieldResolver?.(extractBareType(unwrapped.type)),
                         isSlice: info.isSlice,
                         isMap: info.isMap,
                         elemType: info.elemType,
@@ -738,15 +768,13 @@ export function resolvePath(
                     };
                 }
 
-                // Resolve the remaining path segments through this field's type.
                 const nextFields =
                     cleanFields(unwrapped.fields) ??
-                    fieldResolver?.(unwrapped.type) ??
+                    fieldResolver?.(extractBareType(unwrapped.type)) ??
                     [];
                 return resolveFieldsDeep(path.slice(1), nextFields, fieldResolver);
             }
 
-            // Generic map with no known typed keys — any key is considered valid.
             if (path.length === 2) {
                 return { typeStr: dotFrame.elemType || 'unknown', found: true };
             } else if (path.length > 2) {
@@ -760,7 +788,7 @@ export function resolvePath(
             }
         }
 
-        // Fallback for isolated block validation:
+        // Fallback for isolated block validation
         const f = getFields(dotFrame.typeStr, dotFrame.fields);
         if (f.length === 0) {
             let topVar = vars.get(path[0]);
@@ -771,7 +799,7 @@ export function resolvePath(
                     return {
                         typeStr: topVar.type,
                         found: true,
-                        fields: cleanFields(topVar.fields),
+                        fields: cleanFields(topVar.fields) ?? fieldResolver?.(extractBareType(topVar.type)),
                         isSlice: info.isSlice,
                         isMap: info.isMap,
                         elemType: info.elemType,
@@ -785,17 +813,24 @@ export function resolvePath(
                 const f2 = getFields(topVar.type, topVar.fields);
                 return resolveFields(path.slice(1), f2, info.isMap, info.elemType, info.isSlice, fieldResolver);
             }
-            // Dot frame exists but has no field metadata — the context type is unknown.
-            // Be permissive: we cannot confidently declare a field missing when we don't
-            // know the context shape. Returning found:true suppresses false positives
-            // without hiding real errors in scopes where we DO have field info.
             return { typeStr: 'unknown', found: true };
         }
 
         return { typeStr: 'unknown', found: false };
     }
 
-    // Root scope: resolve against top-level vars
+    // 6. Root scope: if vars has '.' (e.g. footer.html), check fields of '.' first
+    if (vars.has('.')) {
+        let dotVar = vars.get('.')!;
+        dotVar = unwrapVar(dotVar, fieldResolver);
+        const f = getFields(dotVar.type, dotVar.fields);
+        if (f.length > 0) {
+            const res = resolveFieldsDeep(path, f, fieldResolver);
+            if (res.found) return res;
+        }
+    }
+
+    // 7. Root scope: resolve against top-level named vars (e.g. visit, management)
     let topVar = vars.get(path[0]);
     if (!topVar) {
         return { typeStr: 'unknown', found: false };
@@ -808,7 +843,7 @@ export function resolvePath(
         return {
             typeStr: topVar.type,
             found: true,
-            fields: cleanFields(topVar.fields),
+            fields: cleanFields(topVar.fields) ?? fieldResolver?.(extractBareType(topVar.type)),
             isSlice: info.isSlice,
             isMap: info.isMap,
             elemType: info.elemType,

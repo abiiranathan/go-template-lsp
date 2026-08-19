@@ -625,6 +625,18 @@ export class TypeInferencer {
                     isSlice: frame.isSlice,
                 };
             }
+
+            const dotVar = this.vars.get('.');
+            if (dotVar) {
+                return {
+                    typeStr: dotVar.type,
+                    fields: dotVar.fields,
+                    isMap: dotVar.isMap,
+                    keyType: dotVar.keyType,
+                    elemType: dotVar.elemType,
+                    isSlice: dotVar.isSlice,
+                };
+            }
             return { typeStr: 'context' };
         }
 
@@ -672,19 +684,17 @@ export class TypeInferencer {
         }
 
         // Root scope: resolve against top-level vars
-        const topVar = this.vars.get(path[0]);
-        if (topVar) {
-            if (path.length === 1) {
-                return {
-                    typeStr: topVar.type,
-                    fields: topVar.fields,
-                    isSlice: topVar.isSlice,
-                    isMap: topVar.isMap,
-                    elemType: topVar.elemType,
-                    keyType: topVar.keyType,
-                };
+        const dotVar = this.vars.get('.');
+        if (dotVar) {
+            let fields = dotVar.fields;
+            if ((!fields || fields.length === 0) && dotVar.type) {
+                const bare = extractBareType(dotVar.type);
+                fields = this.fieldResolver?.(bare);
             }
-            return this.resolveFieldPath(path.slice(1), topVar.fields ?? []);
+            if (fields && fields.length > 0) {
+                const res = this.resolveFieldPath(path, fields);
+                if (res) return res;
+            }
         }
 
         return null;

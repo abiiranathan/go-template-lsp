@@ -183,10 +183,8 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 
 func (h *Handler) RenderDashboard(inpatient bool) rex.HandlerFunc {
 	return func(c *rex.Context) error {
-		templateName := "views/dashboard.html" // Dynamic template
-
 		// Magic happens here. Try renaming template name to something not found!
-		return c.Render(templateName, rex.Map{
+		return c.Render("views/dashboard.html", rex.Map{
 			"visit": Visit{},
 			"roles": map[string]string{"admin": "Administrator", "user": "Normal User"},
 		})

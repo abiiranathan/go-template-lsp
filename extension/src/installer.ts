@@ -11,7 +11,6 @@ const BINARY_NAME = process.platform === 'win32' ? 'gotpl-analyzer.exe' : 'gotpl
 const PROXY_URL = `https://proxy.golang.org/${MODULE_PATH.toLowerCase()}/@latest`;
 
 export class AnalyzerInstaller {
-
     /**
      * Gets the installed version by executing `gotpl-analyzer -version`.
      */
@@ -31,8 +30,17 @@ export class AnalyzerInstaller {
      */
     static async getLatestRemoteVersion(): Promise<string | null> {
         return new Promise((resolve) => {
-            const req = https.get(PROXY_URL, { timeout: 3000 }, (res) => {
+            const options: https.RequestOptions = {
+                headers: {
+                    'User-Agent': 'vscode-gotpl-lsp',
+                    'Accept': 'application/json',
+                },
+                timeout: 8000, // 8-second timeout for slow connections
+            };
+
+            const req = https.get(PROXY_URL, options, (res) => {
                 if (res.statusCode !== 200) {
+                    res.resume();
                     resolve(null);
                     return;
                 }
@@ -41,7 +49,7 @@ export class AnalyzerInstaller {
                 res.on('end', () => {
                     try {
                         const parsed = JSON.parse(rawData);
-                        resolve(parsed.Version || null); // e.g. "v0.2.1"
+                        resolve(parsed.Version || null); // e.g. "v0.5.0"
                     } catch {
                         resolve(null);
                     }
@@ -58,38 +66,59 @@ export class AnalyzerInstaller {
 
     /**
      * Checks if an update is available and prompts the user.
+     * @param interactive - When true (manual command click), shows progress and feedback dialogs.
      */
-    static async checkForUpdates(analyzerPath: string, outputChannel: vscode.OutputChannel): Promise<void> {
-        try {
-            const [installed, latest] = await Promise.all([
-                this.getInstalledVersion(analyzerPath),
-                this.getLatestRemoteVersion(),
-            ]);
+    static async checkForUpdates(
+        analyzerPath: string,
+        outputChannel: vscode.OutputChannel,
+        interactive = false
+    ): Promise<void> {
+        const runCheck = async () => {
+            try {
+                const [installed, latest] = await Promise.all([
+                    this.getInstalledVersion(analyzerPath),
+                    this.getLatestRemoteVersion(),
+                ]);
 
-            outputChannel.appendLine(`[Installer] Fetched versions: installed=${installed}, latest=${latest}`);
+                outputChannel.appendLine(`[Installer] Version check: installed=${installed ?? 'unknown'}, latest=${latest ?? 'unknown'}`);
 
-            if (!installed || !latest) {
-                outputChannel.appendLine(`[Installer] Skipping update check — missing version info.`);
-                return;
-            }
-
-            outputChannel.appendLine(`[Installer] Analyzer version: installed=${installed}, latest=${latest}`);
-
-            if (this.isNewerVersion(installed, latest)) {
-                const updateItem = 'Update Now';
-                const selection = await vscode.window.showInformationMessage(
-                    `A new version of gotpl-analyzer is available (${installed} → ${latest}).`,
-                    updateItem
-                );
-
-                if (selection === updateItem) {
-                    await this.installAnalyzer(outputChannel);
+                if (!installed || !latest) {
+                    outputChannel.appendLine(`[Installer] Skipping update check — could not resolve version information.`);
+                    if (interactive) {
+                        vscode.window.showWarningMessage('Could not retrieve gotpl-analyzer release info from proxy.golang.org.');
+                    }
+                    return;
                 }
-            } else {
-                await vscode.window.showInformationMessage(`gotpl-analyzer is already the newest version`);
+
+                if (this.isNewerVersion(installed, latest)) {
+                    const updateItem = 'Update Now';
+                    const selection = await vscode.window.showInformationMessage(
+                        `A new version of gotpl-analyzer is available (${installed} → ${latest}).`,
+                        updateItem
+                    );
+
+                    if (selection === updateItem) {
+                        await this.installAnalyzer(outputChannel);
+                    }
+                } else if (interactive) {
+                    await vscode.window.showInformationMessage(`gotpl-analyzer is up to date (${installed}).`);
+                }
+            } catch (err) {
+                outputChannel.appendLine(`[Installer] Update check failed: ${err}`);
+                if (interactive) {
+                    vscode.window.showErrorMessage(`Update check failed: ${err}`);
+                }
             }
-        } catch (err) {
-            outputChannel.appendLine(`[Installer] Update check failed: ${err}`);
+        };
+
+        if (interactive) {
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'Checking for gotpl-analyzer updates...',
+                cancellable: false,
+            }, runCheck);
+        } else {
+            await runCheck();
         }
     }
 
@@ -120,12 +149,14 @@ export class AnalyzerInstaller {
     }
 
     /**
-     * Simple SemVer comparison (returns true if remote > current).
+     * SemVer comparison (returns true if remote > current).
      */
     private static isNewerVersion(current: string, remote: string): boolean {
-        const parse = (v: string) => v.replace(/^v/, '').split('-')[0].split('.').map(n => parseInt(n, 10) || 0);
-        const [cMajor, cMinor, cPatch] = parse(current);
-        const [rMajor, rMinor, rPatch] = parse(remote);
+        const parse = (v: string) =>
+            v.replace(/^v/, '').split('-')[0].split('.').map((n) => parseInt(n, 10) || 0);
+
+        const [cMajor = 0, cMinor = 0, cPatch = 0] = parse(current);
+        const [rMajor = 0, rMinor = 0, rPatch = 0] = parse(remote);
 
         if (rMajor > cMajor) return true;
         if (rMajor === cMajor && rMinor > cMinor) return true;
@@ -146,8 +177,8 @@ export class AnalyzerInstaller {
 
         let analyzerPath = await this.getAnalyzerPath();
         if (analyzerPath) {
-            // Check for updates asynchronously in the background
-            void this.checkForUpdates(analyzerPath, outputChannel);
+            // Check for updates in background on startup (non-interactive)
+            void this.checkForUpdates(analyzerPath, outputChannel, false);
             return analyzerPath;
         }
 
@@ -197,17 +228,36 @@ export class AnalyzerInstaller {
         }
     }
 
+    /**
+     * Resolves the executable binary path with comprehensive fallback checks.
+     */
     static async getAnalyzerPath(): Promise<string | null> {
+        // 1. Check user-configured path
+        const configPath = vscode.workspace.getConfiguration('gotpl').get<string>('goAnalyzerPath');
+        if (configPath && fs.existsSync(configPath)) {
+            return configPath;
+        }
+
+        // 2. Check GOPATH/bin
         const goBin = await this.getGoBinPath();
         if (goBin) {
             const binPath = path.join(goBin, BINARY_NAME);
             if (fs.existsSync(binPath)) return binPath;
         }
 
+        // 3. Check default ~/go/bin
+        const homeDir = process.env.HOME || process.env.USERPROFILE;
+        if (homeDir) {
+            const defaultGoBin = path.join(homeDir, 'go', 'bin', BINARY_NAME);
+            if (fs.existsSync(defaultGoBin)) return defaultGoBin;
+        }
+
+        // 4. Check system PATH via which/where
         try {
             const command = process.platform === 'win32' ? 'where' : 'which';
             const { stdout } = await exec(`${command} ${BINARY_NAME}`);
-            if (stdout.trim()) return stdout.trim().split('\n')[0];
+            const resolved = stdout.trim().split('\n')[0]?.trim();
+            if (resolved && fs.existsSync(resolved)) return resolved;
         } catch { }
 
         return null;

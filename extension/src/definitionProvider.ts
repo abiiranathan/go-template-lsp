@@ -18,6 +18,7 @@ import { TemplateParser, resolvePath } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { ScopeUtils, isFileBasedPartial } from './scopeUtils';
 import { HoverProvider } from './hoverProvider';
+import path from 'path';
 
 /**
  * DefinitionProvider resolves go-to-definition requests for template and Go source files.
@@ -100,7 +101,8 @@ export class DefinitionProvider {
             }
         }
 
-        if (targetPath.length >= 1) {
+        // Chained nested fields (e.g. .visit.Patient.Name or .Patient.Name)
+        if (targetPath.length > 1 || (targetPath.length === 1 && hitVars.has('.'))) {
             const subResult = resolvePath(
                 targetPath, hitVars, stack, hitLocals,
                 this.scope.buildFieldResolver(hitVars, stack)
@@ -119,7 +121,10 @@ export class DefinitionProvider {
                         );
                     }
                 }
-                return null;
+                // If it's a multi-segment field with no defFile, return null instead of falling through to topVar
+                if (targetPath.length > 1) {
+                    return null;
+                }
             }
         }
 
@@ -201,15 +206,17 @@ export class DefinitionProvider {
     ): vscode.Location | null {
         const line = document.lineAt(position.line).text;
 
-        const renderRegex = /(?:\.Render|ExecuteTemplate)\s*\([^"]*"([^"]+)"/g;
+        const renderRegex = /(?:\.Render|\.HTML|\.ExecuteTemplate|\.Execute|\.RenderTemplate|\.View|\.Template)\s*\([^"]*"([^"]+)"/g;
         let match: RegExpExecArray | null;
         while ((match = renderRegex.exec(line)) !== null) {
             const templatePath = match[1];
-            const nameStart = match.index + match[0].indexOf('"') + 1;
-            if (
-                position.character >= nameStart &&
-                position.character <= nameStart + templatePath.length
-            ) {
+            const quoteIdx = match[0].indexOf('"' + templatePath + '"');
+            if (quoteIdx === -1) continue;
+
+            const nameStart = match.index + quoteIdx + 1;
+            const nameEnd = nameStart + templatePath.length;
+
+            if (position.character >= nameStart && position.character <= nameEnd) {
                 const absPath = this.graphBuilder.resolveTemplatePath(templatePath);
                 if (absPath) {
                     return new vscode.Location(
@@ -412,7 +419,7 @@ export class DefinitionProvider {
     }
 
     private resolveGoFile(filePath: string): string | null {
-        if (fs.existsSync(filePath) && require('path').isAbsolute(filePath)) return filePath;
+        if (fs.existsSync(filePath) && path.isAbsolute(filePath)) return filePath;
         return this.graphBuilder.resolveGoFilePath(filePath);
     }
 

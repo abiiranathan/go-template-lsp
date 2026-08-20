@@ -19,7 +19,8 @@ import { GoAnalyzer } from './analyzer';
 import { KnowledgeGraphBuilder, setKnowledgeGraphBuilder } from './knowledgeGraph';
 import { TemplateValidator } from './validator';
 import { KnowledgeGraphPanel } from './graphPanel';
-import { KnowledgeGraph, GoValidationError, NamedBlockDuplicateError } from './types';
+import { KnowledgeGraph, GoValidationError, NamedBlockDuplicateError, RenderCall } from './types';
+
 import { config } from './config';
 import { AnalyzerInstaller } from './installer';
 
@@ -32,8 +33,11 @@ import { AnalyzerInstaller } from './installer';
 const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
   { language: 'html', scheme: 'file' },
   { language: 'go-template', scheme: 'file' },
+  { language: 'gotmpl', scheme: 'file' },
+  { language: 'gohtml', scheme: 'file' },
   { pattern: '**/*.tmpl' },
   { pattern: '**/*.html' },
+  { pattern: '**/*.gohtml' },
 ];
 
 /**
@@ -42,6 +46,9 @@ const TEMPLATE_SELECTOR: vscode.DocumentSelector = [
 const GO_SELECTOR: vscode.DocumentSelector = [
   { language: 'go', scheme: 'file' }
 ];
+
+/** Flag indicating whether the initial index has been executed. */
+let isInitialized = false;
 
 // ─── Module-Level State ───────────────────────────────────────────────────────
 
@@ -215,12 +222,65 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
       await AnalyzerInstaller.checkForUpdates(analyzerPath, outputChannel);
-    })
+    }),
+
+    // Command: Jump from current template to the Go handler(s) that render it
+    vscode.commands.registerCommand('gotpl.goToRenderCall', async (uri?: vscode.Uri) => {
+      const targetUri = uri ?? vscode.window.activeTextEditor?.document.uri;
+      if (!targetUri || !graphBuilder) return;
+
+      const fsPath = targetUri.fsPath;
+      let ctx = graphBuilder.findContextForFile(fsPath);
+      if (!ctx || ctx.renderCalls.length === 0) {
+        ctx = await graphBuilder.findContextForFileAsPartialAsync(fsPath);
+      }
+
+      const calls = (ctx?.renderCalls ?? []).filter(
+        (rc) => rc.file && rc.file !== 'template-call' && rc.file !== 'context-file'
+      );
+
+      if (calls.length === 0) {
+        vscode.window.showInformationMessage(`No Go render calls found for "${path.basename(fsPath)}".`);
+        return;
+      }
+
+      if (calls.length === 1) {
+        await openRenderCallLocation(calls[0]);
+        return;
+      }
+
+      // If rendered in multiple places, show a QuickPick selector
+      const items = calls.map((rc) => ({
+        label: `$(go-file) ${rc.file}:${rc.line}`,
+        description: `Template: ${rc.template}`,
+        detail: rc.vars?.length ? `Vars: ${rc.vars.map((v) => v.name).join(', ')}` : undefined,
+        renderCall: rc,
+      }));
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: `Select a render call for ${path.basename(fsPath)} (${calls.length} found)`,
+      });
+
+      if (selected) {
+        await openRenderCallLocation(selected.renderCall);
+      }
+    }),
   );
 
   // ── Register LSP Providers ──────────────────────────────────────────────────
 
   context.subscriptions.push(
+    vscode.languages.registerReferenceProvider(TEMPLATE_SELECTOR, {
+      async provideReferences(
+        document: vscode.TextDocument,
+        position: vscode.Position,
+        context: vscode.ReferenceContext
+      ) {
+        if (!validator) return null;
+        return await validator.getReferences(document, position, context.includeDeclaration);
+      },
+    }),
+
     // Hover Provider: Resolves type signatures, docs, and struct fields for {{ .Var }}
     vscode.languages.registerHoverProvider(TEMPLATE_SELECTOR, {
       async provideHover(document: vscode.TextDocument, position: vscode.Position) {
@@ -807,6 +867,29 @@ function diagnosticsFromValidationErrors(errors: GoValidationError[]): vscode.Di
     return diagnostic;
   });
 }
+
+/**
+ * Opens the Go file where a template is rendered and positions the cursor on the render call.
+ */
+async function openRenderCallLocation(rc: RenderCall): Promise<void> {
+  if (!graphBuilder) return;
+
+  const absPath = graphBuilder.resolveGoFilePath(rc.file);
+  if (!absPath || !fs.existsSync(absPath)) {
+    vscode.window.showErrorMessage(`Could not find Go file: ${rc.file}`);
+    return;
+  }
+
+  const doc = await vscode.workspace.openTextDocument(absPath);
+  const editor = await vscode.window.showTextDocument(doc);
+  const line = Math.max(0, rc.line - 1);
+  const col = Math.max(0, rc.templateNameStartCol ? rc.templateNameStartCol - 1 : 0);
+  const pos = new vscode.Position(line, col);
+
+  editor.selection = new vscode.Selection(pos, pos);
+  editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+}
+
 
 // ─── Deactivation ─────────────────────────────────────────────────────────────
 

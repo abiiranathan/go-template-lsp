@@ -458,59 +458,71 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 // buildSnapshotFromResult runs template validation and builds an immutable
 // daemon state snapshot from an existing AnalysisResult. This is shared by
 // both the full analyze path and the incremental (templates-only) path.
+// buildSnapshotFromResult runs template validation and builds an immutable
+// daemon state snapshot from an existing AnalysisResult. This is shared by
+// both the full analyze path and the incremental (templates-only) path.
 func (d *analyzerDaemon) buildSnapshotFromResult(
-	result *ast.AnalysisResult,
+	rawResult *ast.AnalysisResult,
 	params daemonAnalyzeParams,
 	baseDir, goFP, tmplFP string,
 ) (ValidationOutput, error) {
+	// Always keep a pristine clone for subsequent incremental runs
+	pristineResult := cloneAnalysisResultDeep(rawResult)
+
 	validationErrors, namedBlocks, namedBlockErrors := validator.ValidateTemplates(
-		result.RenderCalls,
-		result.FuncMaps,
+		pristineResult.RenderCalls,
+		pristineResult.FuncMaps,
 		baseDir,
 		params.TemplateRoot,
 	)
 
 	store := validator.LoadTemplateStore(baseDir, params.TemplateRoot)
-	funcMapReg := validator.BuildFuncMapRegistry(result.FuncMaps)
+	funcMapReg := validator.BuildFuncMapRegistry(pristineResult.FuncMaps)
 
 	// Build render-var index with full partial & named-block variable propagation
 	renderVarIndex := validator.BuildPropagatedRenderVarIndex(
-		result.RenderCalls, namedBlocks, baseDir, params.TemplateRoot, funcMapReg, store,
+		pristineResult.RenderCalls, namedBlocks, baseDir, params.TemplateRoot, funcMapReg, store,
 	)
 
-	// Propagate variables into result.RenderCalls so clients (VS Code Extension,
-	// KnowledgeGraph) receive full variable context for every partial and named block.
-	existingCalls := make(map[string]bool, len(result.RenderCalls))
-	for i := range result.RenderCalls {
-		rc := &result.RenderCalls[i]
+	// Prepare an isolated copy of RenderCalls for JSON payload output & Flatten()
+	outputRenderCalls := cloneRenderCallsDeep(pristineResult.RenderCalls)
+
+	existingCalls := make(map[string]bool, len(outputRenderCalls))
+	for i := range outputRenderCalls {
+		rc := &outputRenderCalls[i]
 		existingCalls[rc.Template] = true
 		if propagated, ok := renderVarIndex[rc.Template]; ok && len(propagated) > 0 {
-			rc.Vars = mergeVarSlices(rc.Vars, propagated)
+			rc.Vars = mergeVarSlicesDeep(rc.Vars, propagated)
 		}
 	}
 
 	for tplName, vars := range renderVarIndex {
 		if !existingCalls[tplName] && len(vars) > 0 {
-			result.RenderCalls = append(result.RenderCalls, ast.RenderCall{
+			outputRenderCalls = append(outputRenderCalls, ast.RenderCall{
 				File:     "template-call",
 				Line:     1,
 				Template: tplName,
-				Vars:     copyTemplateVars(vars),
+				Vars:     cloneTemplateVarsDeep(vars),
 			})
 		}
 	}
 
-	savedResult := cloneAnalysisResult(result)
+	// Working copy for Flatten() to generate Types registry and compact RenderCalls
+	flattenTarget := &ast.AnalysisResult{
+		RenderCalls: outputRenderCalls,
+		FuncMaps:    cloneFuncMapsDeep(pristineResult.FuncMaps),
+		Errors:      pristineResult.Errors,
+	}
 
-	result.Flatten()
+	flattenTarget.Flatten()
 
 	output := ValidationOutput{
-		RenderCalls:      result.RenderCalls,
-		FuncMaps:         result.FuncMaps,
-		Errors:           result.Errors,
+		RenderCalls:      flattenTarget.RenderCalls,
+		FuncMaps:         flattenTarget.FuncMaps,
+		Errors:           flattenTarget.Errors,
 		NamedBlocks:      namedBlocks,
 		NamedBlockErrors: namedBlockErrors,
-		Types:            result.Types,
+		Types:            flattenTarget.Types,
 	}
 	if params.Validate {
 		output.ValidationErrors = validationErrors
@@ -526,12 +538,12 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 		output:               output,
 		renderVarsByTemplate: renderVarIndex,
 		funcMaps:             funcMapReg,
-		typeRegistry:         result.Types,
+		typeRegistry:         flattenTarget.Types,
 		namedBlocks:          namedBlocks,
 		partialTargets:       validator.FindPartialTargets(baseDir, params.TemplateRoot),
 		goFingerprint:        goFP,
 		templateFingerprint:  tmplFP,
-		analysisResult:       savedResult,
+		analysisResult:       pristineResult,
 	}
 
 	d.state.Store(snap)
@@ -539,25 +551,95 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 	return output, nil
 }
 
-func copyTemplateVars(vars []ast.TemplateVar) []ast.TemplateVar {
-	out := make([]ast.TemplateVar, len(vars))
-	copy(out, vars)
+func cloneAnalysisResultDeep(r *ast.AnalysisResult) *ast.AnalysisResult {
+	if r == nil {
+		return nil
+	}
+	return &ast.AnalysisResult{
+		RenderCalls: cloneRenderCallsDeep(r.RenderCalls),
+		FuncMaps:    cloneFuncMapsDeep(r.FuncMaps),
+		Errors:      append([]string(nil), r.Errors...),
+	}
+}
+
+func cloneRenderCallsDeep(calls []ast.RenderCall) []ast.RenderCall {
+	out := make([]ast.RenderCall, len(calls))
+	for i, rc := range calls {
+		out[i] = rc
+		out[i].Vars = cloneTemplateVarsDeep(rc.Vars)
+	}
 	return out
 }
 
-func mergeVarSlices(a, b []ast.TemplateVar) []ast.TemplateVar {
+func cloneTemplateVarsDeep(vars []ast.TemplateVar) []ast.TemplateVar {
+	out := make([]ast.TemplateVar, len(vars))
+	for i, v := range vars {
+		out[i] = v
+		out[i].Fields = cloneFieldInfosDeep(v.Fields)
+	}
+	return out
+}
+
+func cloneFieldInfosDeep(fields []ast.FieldInfo) []ast.FieldInfo {
+	if len(fields) == 0 {
+		return nil
+	}
+	out := make([]ast.FieldInfo, len(fields))
+	for i, f := range fields {
+		out[i] = f
+		out[i].Fields = cloneFieldInfosDeep(f.Fields)
+		if len(f.Params) > 0 {
+			out[i].Params = make([]ast.ParamInfo, len(f.Params))
+			copy(out[i].Params, f.Params)
+		}
+		if len(f.Returns) > 0 {
+			out[i].Returns = make([]ast.ParamInfo, len(f.Returns))
+			for j, r := range f.Returns {
+				out[i].Returns[j] = r
+				out[i].Returns[j].Fields = cloneFieldInfosDeep(r.Fields)
+			}
+		}
+	}
+	return out
+}
+
+func cloneFuncMapsDeep(fms []ast.FuncMapInfo) []ast.FuncMapInfo {
+	out := make([]ast.FuncMapInfo, len(fms))
+	for i, fm := range fms {
+		out[i] = fm
+		if len(fm.Params) > 0 {
+			out[i].Params = make([]ast.ParamInfo, len(fm.Params))
+			copy(out[i].Params, fm.Params)
+		}
+		if len(fm.Returns) > 0 {
+			out[i].Returns = make([]ast.ParamInfo, len(fm.Returns))
+			for j, r := range fm.Returns {
+				out[i].Returns[j] = r
+				out[i].Returns[j].Fields = cloneFieldInfosDeep(r.Fields)
+			}
+		}
+		out[i].ReturnTypeFields = cloneFieldInfosDeep(fm.ReturnTypeFields)
+	}
+	return out
+}
+
+func mergeVarSlicesDeep(a, b []ast.TemplateVar) []ast.TemplateVar {
 	seen := make(map[string]bool, len(a)+len(b))
 	res := make([]ast.TemplateVar, 0, len(a)+len(b))
 	for _, v := range a {
 		if !seen[v.Name] {
 			seen[v.Name] = true
-			res = append(res, v)
+			clone := v
+			clone.Fields = cloneFieldInfosDeep(v.Fields)
+			res = append(res, clone)
 		}
 	}
 	for _, v := range b {
 		if !seen[v.Name] {
 			seen[v.Name] = true
-			res = append(res, v)
+			clone := v
+			clone.Fields = cloneFieldInfosDeep(v.Fields)
+			res = append(res, clone)
 		}
 	}
 	return res
@@ -584,25 +666,6 @@ func (d *analyzerDaemon) reanalyzeTemplates(params daemonAnalyzeParams) (Validat
 	}
 
 	return d.buildSnapshotFromResult(prev.analysisResult, params, baseDir, goFP, tmplFP)
-}
-
-// cloneAnalysisResult creates a shallow copy of an AnalysisResult so the
-// original's RenderCalls and FuncMaps are preserved before Flatten() mutates them.
-func cloneAnalysisResult(r *ast.AnalysisResult) *ast.AnalysisResult {
-	clone := &ast.AnalysisResult{
-		Errors: r.Errors,
-		Types:  r.Types,
-	}
-	// Deep-copy render calls since Flatten() strips field trees in-place.
-	clone.RenderCalls = make([]ast.RenderCall, len(r.RenderCalls))
-	for i, rc := range r.RenderCalls {
-		clone.RenderCalls[i] = rc
-		clone.RenderCalls[i].Vars = make([]ast.TemplateVar, len(rc.Vars))
-		copy(clone.RenderCalls[i].Vars, rc.Vars)
-	}
-	clone.FuncMaps = make([]ast.FuncMapInfo, len(r.FuncMaps))
-	copy(clone.FuncMaps, r.FuncMaps)
-	return clone
 }
 
 // computeGoFingerprint creates an mtime-based fingerprint of all Go source files.

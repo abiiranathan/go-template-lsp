@@ -38,10 +38,67 @@ export class GoAnalyzer {
 
   constructor(resolvedAnalyzerPath: string, outputChannel: vscode.OutputChannel) {
     this.outputChannel = outputChannel;
-    // Allow manual config override, otherwise use the path resolved by the installer
-    const configPath = config.analyzerPath();
-    this.analyzerPath = (configPath && fs.existsSync(configPath)) ? configPath : resolvedAnalyzerPath;
+    this.analyzerPath = this.resolveAnalyzerPath(resolvedAnalyzerPath);
   }
+
+  /**
+   * Determines which analyzer binary to invoke, preferring, in order:
+   *   1. An explicit user-configured path (if it exists on disk).
+   *   2. A binary found on PATH (e.g. installed via `go install`).
+   *   3. The path resolved by the installer at activation time.
+   *
+   * Checking PATH matters because `go install` puts binaries in
+   * GOBIN/GOPATH/bin, which is commonly on PATH but may differ from
+   * wherever the extension's installer placed its own copy — so this
+   * avoids running a stale or duplicate binary during development.
+   */
+  private resolveAnalyzerPath(resolvedAnalyzerPath: string): string {
+    const configPath = config.analyzerPath();
+    if (configPath && fs.existsSync(configPath)) {
+      this.outputChannel.appendLine(`[Analyzer] Using configured analyzer path: ${configPath}`);
+      return configPath;
+    }
+
+    const pathBinary = this.findOnPath('gotpl-analyzer');
+    if (pathBinary) {
+      this.outputChannel.appendLine(`[Analyzer] Using analyzer found on PATH: ${pathBinary}`);
+      return pathBinary;
+    }
+
+    this.outputChannel.appendLine(`[Analyzer] Falling back to installer-resolved path: ${resolvedAnalyzerPath}`);
+    return resolvedAnalyzerPath;
+  }
+
+
+  /**
+   * Searches PATH for an executable with the given name, respecting
+   * platform-specific separators and the .exe suffix on Windows.
+   * Returns the absolute path if found, otherwise undefined.
+   */
+  private findOnPath(binaryName: string): string | undefined {
+    const pathEnv = process.env.PATH ?? process.env.Path ?? '';
+    if (!pathEnv) return undefined;
+
+    const isWindows = process.platform === 'win32';
+    const candidateNames = isWindows ? [`${binaryName}.exe`, binaryName] : [binaryName];
+    const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+
+    for (const dir of dirs) {
+      for (const name of candidateNames) {
+        const candidate = path.join(dir, name);
+        try {
+          const stat = fs.statSync(candidate);
+          if (stat.isFile()) {
+            return candidate;
+          }
+        } catch {
+          // Not found in this dir; continue searching.
+        }
+      }
+    }
+    return undefined;
+  }
+
 
   /**
    * Analyze the workspace by invoking the Go analyzer once.

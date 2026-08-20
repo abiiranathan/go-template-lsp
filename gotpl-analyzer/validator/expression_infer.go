@@ -344,6 +344,7 @@ func typesCompatible(expected string, actual *ExpressionTypeResult) bool {
 		return true
 	}
 	expected = strings.TrimSpace(expected)
+	expected = strings.TrimPrefix(expected, "...") // Trim ... from variadic types.
 	actualStr := strings.TrimSpace(actual.TypeStr)
 	if expected == "" || expected == "any" || expected == "interface{}" {
 		return true

@@ -146,6 +146,9 @@
     <p>{{ .Name }}</p>
     {{ end }}
     {{ end }}
+
+    <!-- Test Variadic function inference -->
+    {{ $joinedStr := join "Abiira" "Nathan" }}
 </body>
 
 </html>

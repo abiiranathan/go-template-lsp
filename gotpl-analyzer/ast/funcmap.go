@@ -267,14 +267,24 @@ func extractSignatureFromType(
 
 // extractSignatureInfo extracts detailed parameter and return type information
 // from a function signature.
+// extractSignatureInfo extracts detailed parameter and return type information
+// from a function signature.
 func extractSignatureInfo(sig *types.Signature) (params, returns []ParamInfo, args []string) {
 	// Extract parameters
-	params = make([]ParamInfo, sig.Params().Len())
-	args = make([]string, sig.Params().Len())
+	numParams := sig.Params().Len()
+	params = make([]ParamInfo, numParams)
+	args = make([]string, numParams)
 
-	for i := 0; i < sig.Params().Len(); i++ {
+	for i := range numParams {
 		p := sig.Params().At(i)
 		ts := normalizeTypeStr(p.Type())
+		if sig.Variadic() && i == numParams-1 {
+			if slice, ok := p.Type().(*types.Slice); ok {
+				ts = "..." + normalizeTypeStr(slice.Elem())
+			} else {
+				ts = "..." + strings.TrimPrefix(ts, "[]")
+			}
+		}
 		params[i] = ParamInfo{Name: p.Name(), TypeStr: ts}
 		args[i] = ts
 	}

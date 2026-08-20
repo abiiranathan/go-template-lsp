@@ -153,6 +153,9 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			"getAuthUser": getAuthUser,
 			"dict":        dict,
 			"upper":       strings.ToUpper,
+			"join": func(s ...string) string {
+				return strings.Join(s, " ")
+			},
 		}
 
 		template.New("").Funcs(funcMap)

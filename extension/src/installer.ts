@@ -211,6 +211,7 @@ export class AnalyzerInstaller {
      */
     static async buildLocalAnalyzer(context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel): Promise<string | null> {
         const analyzerSourceDir = path.join(context.extensionPath, '..', 'gotpl-analyzer');
+
         const outputBinary = path.join(analyzerSourceDir, BINARY_NAME);
 
         if (!fs.existsSync(analyzerSourceDir)) {

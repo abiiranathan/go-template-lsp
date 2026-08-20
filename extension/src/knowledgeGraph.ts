@@ -88,7 +88,6 @@ export class KnowledgeGraphBuilder {
             const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === absolutePath);
             content = openDoc ? openDoc.getText() : fs.readFileSync(absolutePath, 'utf8');
         } catch (err) {
-            this.outputChannel.appendLine(`[KnowledgeGraph] Failed to read file ${absolutePath}: ${err}`);
             return undefined;
         }
 
@@ -98,7 +97,6 @@ export class KnowledgeGraphBuilder {
             this.astCache.set(absolutePath, nodes);
             return nodes;
         } catch (err) {
-            this.outputChannel.appendLine(`[KnowledgeGraph] Parse failed for ${absolutePath}: ${err}`);
             return undefined;
         }
     }

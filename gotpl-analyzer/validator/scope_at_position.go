@@ -2,6 +2,7 @@ package validator
 
 import (
 	"maps"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -94,10 +95,10 @@ func GetHoverResult(
 	// Build the dot context for completion info.
 	var dotType string
 	var dotFields []ast.FieldInfo
-	for i := len(ps.ScopeStack) - 1; i >= 0; i-- {
-		if len(ps.ScopeStack[i].Fields) > 0 || ps.ScopeStack[i].TypeStr != "" {
-			dotType = ps.ScopeStack[i].TypeStr
-			dotFields = ps.ScopeStack[i].Fields
+	for _, v := range slices.Backward(ps.ScopeStack) {
+		if len(v.Fields) > 0 || v.TypeStr != "" {
+			dotType = v.TypeStr
+			dotFields = v.Fields
 			break
 		}
 	}

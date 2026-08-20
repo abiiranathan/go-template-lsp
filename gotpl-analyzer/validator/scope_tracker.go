@@ -2,6 +2,7 @@ package validator
 
 import (
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/abiiranathan/go-template-lsp/gotpl-analyzer/ast"
@@ -503,8 +504,8 @@ func lookupLocalVar(expr string, scopeStack []ScopeType) (ast.TemplateVar, []str
 	}
 
 	name := parts[0]
-	for i := len(scopeStack) - 1; i >= 0; i-- {
-		locals := scopeStack[i].Locals
+	for _, s := range slices.Backward(scopeStack) {
+		locals := s.Locals
 		if locals == nil {
 			continue
 		}

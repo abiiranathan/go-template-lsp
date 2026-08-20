@@ -83,8 +83,8 @@ func (i expressionInferencer) infer(expr string) *ExpressionTypeResult {
 	}
 
 	// Skip the pre-declaration actions and only infer the last action (the real expression)
-	for idx := len(tree.Root.Nodes) - 1; idx >= 0; idx-- {
-		action, ok := tree.Root.Nodes[idx].(*templateparse.ActionNode)
+	for _, v := range slices.Backward(tree.Root.Nodes) {
+		action, ok := v.(*templateparse.ActionNode)
 		if !ok {
 			continue
 		}
@@ -447,8 +447,8 @@ func (i expressionInferencer) resolveIdentifier(name string) *ExpressionTypeResu
 		return templateVarToExpressionResult(v)
 	}
 
-	for idx := len(i.scopeStack) - 1; idx >= 0; idx-- {
-		if local, ok := i.scopeStack[idx].Locals[name]; ok {
+	for _, v := range slices.Backward(i.scopeStack) {
+		if local, ok := v.Locals[name]; ok {
 			return templateVarToExpressionResult(local)
 		}
 	}

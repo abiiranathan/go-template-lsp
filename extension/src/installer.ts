@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as https from 'https';
 import * as util from 'util';
+import { GoResolver } from './goResolver';
 
 const exec = util.promisify(cp.exec);
 const MODULE_PATH = 'github.com/abiiranathan/go-template-lsp/gotpl-analyzer';
@@ -12,11 +13,34 @@ const PROXY_URL = `https://proxy.golang.org/${MODULE_PATH.toLowerCase()}/@latest
 
 export class AnalyzerInstaller {
     /**
+     * Shared GoResolver instance for this extension host session. Reads
+     * the `gotpl.goBinaryPath` setting as an explicit override and logs
+     * through the output channel passed to ensureInstalled/installAnalyzer.
+     * Lazily constructed so the VS Code configuration API is only
+     * touched once actually needed, not at module load time.
+     */
+    private static goResolver: GoResolver | undefined;
+
+    /**
+     * Gets (creating if necessary) the shared GoResolver for this session.
+     */
+    private static getGoResolver(outputChannel?: vscode.OutputChannel): GoResolver {
+        if (!this.goResolver) {
+            const configuredPath = vscode.workspace.getConfiguration('gotpl').get<string>('goBinaryPath');
+            this.goResolver = new GoResolver({
+                configuredPath: configuredPath || null,
+                log: (msg: string) => outputChannel?.appendLine(`[Installer] ${msg}`),
+            });
+        }
+        return this.goResolver;
+    }
+
+    /**
      * Gets the installed version by executing `gotpl-analyzer -version`.
      */
     static async getInstalledVersion(analyzerPath: string): Promise<string | null> {
         try {
-            const { stdout } = await exec(`"${analyzerPath}" -version`);
+            const { stdout } = await exec(`${GoResolver.quote(analyzerPath)} -version`);
             const version = stdout.trim();
             return version ? version : null;
         } catch {
@@ -124,6 +148,8 @@ export class AnalyzerInstaller {
 
     /**
      * Installs or updates the analyzer using `go install ...@latest`.
+     * Resolves the `go` binary via GoResolver rather than relying on
+     * the extension host's inherited PATH.
      */
     static async installAnalyzer(outputChannel: vscode.OutputChannel): Promise<string | null> {
         return await vscode.window.withProgress({
@@ -131,11 +157,20 @@ export class AnalyzerInstaller {
             title: 'Updating gotpl-analyzer to latest...',
             cancellable: false,
         }, async () => {
-            try {
-                outputChannel.appendLine(`[Installer] Running: go install ${MODULE_PATH}@latest`);
-                await exec(`go install ${MODULE_PATH}@latest`);
+            const resolver = this.getGoResolver(outputChannel);
+            const { binaryPath: goBinary } = await resolver.resolveGoBinary();
+            if (!goBinary) {
+                const msg = 'Could not locate the "go" executable. Ensure Go is installed, or set "gotpl.goBinaryPath" in settings to its full path.';
+                outputChannel.appendLine(`[Installer] ${msg}`);
+                vscode.window.showErrorMessage(msg);
+                return null;
+            }
 
-                const analyzerPath = await this.getAnalyzerPath();
+            try {
+                outputChannel.appendLine(`[Installer] Running: ${GoResolver.quote(goBinary)} install ${MODULE_PATH}@latest`);
+                await resolver.run(['install', `${MODULE_PATH}@latest`]);
+
+                const analyzerPath = await this.getAnalyzerPath(outputChannel);
                 if (!analyzerPath) throw new Error('Binary not found in GOPATH/bin after install.');
 
                 vscode.window.showInformationMessage('Go Template LSP analyzer updated successfully!');
@@ -175,7 +210,7 @@ export class AnalyzerInstaller {
             if (localBin) return localBin;
         }
 
-        let analyzerPath = await this.getAnalyzerPath();
+        let analyzerPath = await this.getAnalyzerPath(outputChannel);
         if (analyzerPath) {
             // Check for updates in background on startup (non-interactive)
             void this.checkForUpdates(analyzerPath, outputChannel, false);
@@ -196,12 +231,22 @@ export class AnalyzerInstaller {
         return await this.installAnalyzer(outputChannel);
     }
 
-    static async getGoBinPath(): Promise<string | null> {
+    /**
+     * Resolves `$GOPATH/bin` (first entry if GOPATH lists multiple
+     * paths) by running the resolved go binary via GoResolver, rather
+     * than a bare `go env GOPATH` that depends on the extension host's
+     * inherited PATH.
+     */
+    static async getGoBinPath(outputChannel?: vscode.OutputChannel): Promise<string | null> {
+        const resolver = this.getGoResolver(outputChannel);
         try {
-            const { stdout } = await exec('go env GOPATH');
-            const firstGoPath = stdout.trim().split(path.delimiter)[0];
+            const result = await resolver.run(['env', 'GOPATH']);
+            if (!result) return null; // go binary could not be resolved
+            const firstGoPath = result.stdout.trim().split(path.delimiter)[0];
+            if (!firstGoPath) return null;
             return path.join(firstGoPath, 'bin');
-        } catch {
+        } catch (err) {
+            outputChannel?.appendLine(`[Installer] 'go env GOPATH' failed: ${err}`);
             return null;
         }
     }
@@ -211,16 +256,20 @@ export class AnalyzerInstaller {
      */
     static async buildLocalAnalyzer(context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel): Promise<string | null> {
         const analyzerSourceDir = path.join(context.extensionPath, '..', 'gotpl-analyzer');
-
         const outputBinary = path.join(analyzerSourceDir, BINARY_NAME);
 
         if (!fs.existsSync(analyzerSourceDir)) {
             return null;
         }
 
+        const resolver = this.getGoResolver(outputChannel);
         outputChannel.appendLine('[Installer] Development mode detected. Building local analyzer...');
         try {
-            await exec(`go build -o ${BINARY_NAME} .`, { cwd: analyzerSourceDir });
+            const result = await resolver.run(['build', '-o', BINARY_NAME, '.'], { cwd: analyzerSourceDir });
+            if (!result) {
+                outputChannel.appendLine('[Installer] Cannot build local analyzer — go binary not resolved.');
+                return null;
+            }
             outputChannel.appendLine('[Installer] Local build successful.');
             return outputBinary;
         } catch (err) {
@@ -232,7 +281,7 @@ export class AnalyzerInstaller {
     /**
      * Resolves the executable binary path with comprehensive fallback checks.
      */
-    static async getAnalyzerPath(): Promise<string | null> {
+    static async getAnalyzerPath(outputChannel?: vscode.OutputChannel): Promise<string | null> {
         // 1. Check user-configured path
         const configPath = vscode.workspace.getConfiguration('gotpl').get<string>('goAnalyzerPath');
         if (configPath && fs.existsSync(configPath)) {
@@ -240,7 +289,7 @@ export class AnalyzerInstaller {
         }
 
         // 2. Check GOPATH/bin
-        const goBin = await this.getGoBinPath();
+        const goBin = await this.getGoBinPath(outputChannel);
         if (goBin) {
             const binPath = path.join(goBin, BINARY_NAME);
             if (fs.existsSync(binPath)) return binPath;
@@ -264,3 +313,4 @@ export class AnalyzerInstaller {
         return null;
     }
 }
+

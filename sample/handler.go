@@ -156,6 +156,9 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 			"join": func(s ...string) string {
 				return strings.Join(s, " ")
 			},
+			"printPermission": func(p Permission) {
+				fmt.Println(p)
+			},
 		}
 
 		template.New("").Funcs(funcMap)

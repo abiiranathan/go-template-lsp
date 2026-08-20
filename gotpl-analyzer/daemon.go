@@ -4,13 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -223,24 +226,69 @@ type analyzerDaemon struct {
 	analyzeMu sync.Mutex
 }
 
+var (
+	logFileOnce sync.Once
+	logFile     *os.File
+	logMu       sync.Mutex
+)
+
+func getLogWriter() *os.File {
+	logFileOnce.Do(func() {
+		f, err := os.OpenFile(filepath.Join(os.TempDir(), "gotpl-daemon.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err == nil {
+			logFile = f
+		}
+	})
+	return logFile
+}
+
+// debugLog writes to a log file in the temp directory.
+// Since stdout is used for RPC, this is the only way to see what's happening.
+func debugLog(format string, v ...any) {
+	f := getLogWriter()
+	if f == nil {
+		return
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	fmt.Fprintf(f, "[DAEMON] "+format+"\n", v...)
+}
+
 // runDaemon starts a JSON-RPC 2.0 server over stdin/stdout that serves
 // analysis, validation, hover, and type-inference requests. The daemon
 // maintains an immutable snapshot of analysis results that is atomically
 // swapped on each analyze call, enabling lock-free reads for concurrent
 // read-only operations.
 func runDaemon(stdin io.Reader, stdout io.Writer) error {
+	// Check if 'go' is available in current PATH.
+	if _, err := exec.LookPath("go"); err != nil {
+		debugLog("WARNING: 'go' not found in PATH. Attempting to repair PATH...")
+		// Try adding standard Go binary paths
+		newPath := os.Getenv("PATH") + ":/usr/local/go/bin:" + filepath.Join(os.Getenv("HOME"), "go/bin")
+		os.Setenv("PATH", newPath)
+		if _, err2 := exec.LookPath("go"); err2 == nil {
+			debugLog("Successfully repaired PATH. 'go' is now available.")
+		} else {
+			debugLog("CRITICAL: Failed to find 'go' even after repair. Analysis WILL fail.")
+		}
+	}
+
 	server := &analyzerDaemon{
 		templateOverlays: make(map[string]string),
 	}
 	reader := bufio.NewReader(stdin)
 	writer := bufio.NewWriter(stdout)
 
+	debugLog("Daemon started. Monitoring stdin for RPC requests.")
+
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
 			if err == io.EOF {
+				debugLog("Stdin closed (EOF). Shutting down.")
 				return nil
 			}
+			debugLog("Error reading stdin: %v", err)
 			return err
 		}
 
@@ -251,6 +299,7 @@ func runDaemon(stdin io.Reader, stdout io.Writer) error {
 
 		var req rpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
+			debugLog("Parse error on request: %v", err)
 			if err := writeResponse(writer, rpcResponse{
 				JSONRPC: "2.0",
 				Error:   &rpcError{Code: -32700, Message: fmt.Sprintf("invalid request: %v", err)},
@@ -262,10 +311,12 @@ func runDaemon(stdin io.Reader, stdout io.Writer) error {
 
 		resp := server.handle(req)
 		if err := writeResponse(writer, resp); err != nil {
+			debugLog("Error writing response: %v", err)
 			return err
 		}
 
 		if req.Method == "shutdown" {
+			debugLog("Shutdown requested.")
 			return nil
 		}
 	}
@@ -274,11 +325,7 @@ func runDaemon(stdin io.Reader, stdout io.Writer) error {
 // writeResponse marshals an rpcResponse as JSON and writes it as a single
 // newline-terminated line to the buffered writer, then flushes immediately.
 func writeResponse(writer *bufio.Writer, resp rpcResponse) error {
-	data, err := json.Marshal(resp)
-	if err != nil {
-		return err
-	}
-	if _, err := writer.Write(append(data, '\n')); err != nil {
+	if err := json.NewEncoder(writer).Encode(resp); err != nil {
 		return err
 	}
 	return writer.Flush()
@@ -424,40 +471,52 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 	d.analyzeMu.Lock()
 	defer d.analyzeMu.Unlock()
 
+	debugLog("Starting analysis for dir: %s", params.Dir)
+
+	// Resolve absolute paths
+	absDir, err := filepath.Abs(params.Dir)
+	if err != nil {
+		return ValidationOutput{}, fmt.Errorf("invalid analysis directory: %v", err)
+	}
+	params.Dir = absDir
+
 	baseDir := params.Dir
 	if params.TemplateBaseDir != "" {
-		baseDir = params.TemplateBaseDir
+		absBase, err := filepath.Abs(params.TemplateBaseDir)
+		if err != nil {
+			return ValidationOutput{}, fmt.Errorf("invalid template base directory: %v", err)
+		}
+		baseDir = absBase
 	}
 
-	// Compute fingerprints to detect what changed since last analysis.
-	goFP := computeGoFingerprint(params.Dir)
-	tmplFP := computeTemplateFingerprint(baseDir, params.TemplateRoot)
-
-	prev := d.state.Load()
-
-	// Fast Path 1: Absolute cache hit — no file touched at all
-	if prev != nil && prev.goFingerprint == goFP && prev.templateFingerprint == tmplFP &&
-		prev.dir == params.Dir && prev.templateRoot == params.TemplateRoot &&
-		prev.contextFile == params.ContextFile && prev.validate == params.Validate {
-		return prev.output, nil
+	// Compute fingerprints.
+	goFP, err := computeGoFingerprint(params.Dir)
+	if err != nil {
+		debugLog("Error fingerprinting Go files: %v", err)
+	}
+	tmplFP, err := computeTemplateFingerprint(baseDir, params.TemplateRoot)
+	if err != nil {
+		debugLog("Error fingerprinting templates: %v", err)
 	}
 
-	// Fast Path 2: Only templates changed — reuse parsed Go AST and types
-	if prev != nil && prev.goFingerprint == goFP && prev.analysisResult != nil &&
-		prev.dir == params.Dir && prev.contextFile == params.ContextFile {
-		return d.buildSnapshotFromResult(prev.analysisResult, params, baseDir, goFP, tmplFP)
-	}
+	// CACHE REMOVED for now to ensure reliability.
 
 	// Cold path: Full Go source analysis
 	result := ast.AnalyzeDir(params.Dir, params.ContextFile, params.toAnalysisConfig())
+
+	if len(result.Errors) > 0 {
+		debugLog("Go analysis returned %d raw errors", len(result.Errors))
+		for _, e := range result.Errors {
+			debugLog("Analysis error: %s", e)
+		}
+	}
+
 	result.Errors = filterImportErrors(result.Errors)
+	debugLog("Found %d render calls.", len(result.RenderCalls))
 
 	return d.buildSnapshotFromResult(&result, params, baseDir, goFP, tmplFP)
 }
 
-// buildSnapshotFromResult runs template validation and builds an immutable
-// daemon state snapshot from an existing AnalysisResult. This is shared by
-// both the full analyze path and the incremental (templates-only) path.
 // buildSnapshotFromResult runs template validation and builds an immutable
 // daemon state snapshot from an existing AnalysisResult. This is shared by
 // both the full analyze path and the incremental (templates-only) path.
@@ -563,6 +622,9 @@ func cloneAnalysisResultDeep(r *ast.AnalysisResult) *ast.AnalysisResult {
 }
 
 func cloneRenderCallsDeep(calls []ast.RenderCall) []ast.RenderCall {
+	if len(calls) == 0 {
+		return nil
+	}
 	out := make([]ast.RenderCall, len(calls))
 	for i, rc := range calls {
 		out[i] = rc
@@ -572,6 +634,9 @@ func cloneRenderCallsDeep(calls []ast.RenderCall) []ast.RenderCall {
 }
 
 func cloneTemplateVarsDeep(vars []ast.TemplateVar) []ast.TemplateVar {
+	if len(vars) == 0 {
+		return nil
+	}
 	out := make([]ast.TemplateVar, len(vars))
 	for i, v := range vars {
 		out[i] = v
@@ -604,6 +669,9 @@ func cloneFieldInfosDeep(fields []ast.FieldInfo) []ast.FieldInfo {
 }
 
 func cloneFuncMapsDeep(fms []ast.FuncMapInfo) []ast.FuncMapInfo {
+	if len(fms) == 0 {
+		return nil
+	}
 	out := make([]ast.FuncMapInfo, len(fms))
 	for i, fm := range fms {
 		out[i] = fm
@@ -624,19 +692,19 @@ func cloneFuncMapsDeep(fms []ast.FuncMapInfo) []ast.FuncMapInfo {
 }
 
 func mergeVarSlicesDeep(a, b []ast.TemplateVar) []ast.TemplateVar {
-	seen := make(map[string]bool, len(a)+len(b))
+	seen := make(map[string]struct{}, len(a)+len(b))
 	res := make([]ast.TemplateVar, 0, len(a)+len(b))
 	for _, v := range a {
-		if !seen[v.Name] {
-			seen[v.Name] = true
+		if _, exists := seen[v.Name]; !exists {
+			seen[v.Name] = struct{}{}
 			clone := v
 			clone.Fields = cloneFieldInfosDeep(v.Fields)
 			res = append(res, clone)
 		}
 	}
 	for _, v := range b {
-		if !seen[v.Name] {
-			seen[v.Name] = true
+		if _, exists := seen[v.Name]; !exists {
+			seen[v.Name] = struct{}{}
 			clone := v
 			clone.Fields = cloneFieldInfosDeep(v.Fields)
 			res = append(res, clone)
@@ -646,34 +714,17 @@ func mergeVarSlicesDeep(a, b []ast.TemplateVar) []ast.TemplateVar {
 }
 
 func (d *analyzerDaemon) reanalyzeTemplates(params daemonAnalyzeParams) (ValidationOutput, error) {
-	prev := d.state.Load()
-	if prev == nil || prev.analysisResult == nil {
-		// No previous analysis — fall back to full analyze.
-		return d.analyze(params)
-	}
-
-	baseDir := params.Dir
-	if params.TemplateBaseDir != "" {
-		baseDir = params.TemplateBaseDir
-	}
-
-	goFP := prev.goFingerprint
-	tmplFP := computeTemplateFingerprint(baseDir, params.TemplateRoot)
-
-	// If neither Go nor templates changed, return previous output immediately
-	if prev.templateFingerprint == tmplFP {
-		return prev.output, nil
-	}
-
-	return d.buildSnapshotFromResult(prev.analysisResult, params, baseDir, goFP, tmplFP)
+	// Always perform full analyze while cache is disabled to ensure correct template resolution.
+	return d.analyze(params)
 }
 
 // computeGoFingerprint creates an mtime-based fingerprint of all Go source files.
-func computeGoFingerprint(dir string) string {
+func computeGoFingerprint(dir string) (string, error) {
 	h := sha256.New()
-	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	var numBuf [32]byte
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return err
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -685,36 +736,54 @@ func computeGoFingerprint(dir string) string {
 		if strings.HasSuffix(path, ".go") {
 			info, err := d.Info()
 			if err != nil {
-				return nil
+				return err
 			}
-			fmt.Fprintf(h, "%s:%d\n", path, info.ModTime().UnixNano())
+			io.WriteString(h, path)
+			h.Write([]byte{':'})
+			h.Write(strconv.AppendInt(numBuf[:0], info.ModTime().UnixNano(), 10))
+			h.Write([]byte{'\n'})
 		}
 		return nil
 	})
-	if info, err := os.Stat(filepath.Join(dir, "go.sum")); err == nil {
-		fmt.Fprintf(h, "go.sum:%d\n", info.ModTime().UnixNano())
+	if err != nil {
+		return "", err
 	}
-	return fmt.Sprintf("%x", h.Sum(nil))
+	if info, err := os.Stat(filepath.Join(dir, "go.sum")); err == nil {
+		io.WriteString(h, "go.sum:")
+		h.Write(strconv.AppendInt(numBuf[:0], info.ModTime().UnixNano(), 10))
+		h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // computeTemplateFingerprint creates an mtime-based fingerprint of template files.
-func computeTemplateFingerprint(baseDir, templateRoot string) string {
+func computeTemplateFingerprint(baseDir, templateRoot string) (string, error) {
 	root := filepath.Join(baseDir, templateRoot)
 	h := sha256.New()
-	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	var numBuf [32]byte
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
 			return nil
 		}
 		if strings.HasSuffix(path, ".html") || strings.HasSuffix(path, ".tmpl") {
 			info, err := d.Info()
 			if err != nil {
-				return nil
+				return err
 			}
-			fmt.Fprintf(h, "%s:%d\n", path, info.ModTime().UnixNano())
+			io.WriteString(h, path)
+			h.Write([]byte{':'})
+			h.Write(strconv.AppendInt(numBuf[:0], info.ModTime().UnixNano(), 10))
+			h.Write([]byte{'\n'})
 		}
 		return nil
 	})
-	return fmt.Sprintf("%x", h.Sum(nil))
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (result daemonValidateTemplateResult, err error) {
@@ -749,7 +818,12 @@ func (d *analyzerDaemon) validateTemplate(params daemonValidateTemplateParams) (
 
 	// Load overlays under read lock (cheap: just a map lookup).
 	d.overlayMu.RLock()
-	overlays := cloneTemplateOverlays(d.templateOverlays)
+	var overlays map[string]string
+	if len(d.templateOverlays) > 0 {
+		overlays = cloneTemplateOverlays(d.templateOverlays)
+	} else {
+		overlays = make(map[string]string, 1)
+	}
 	d.overlayMu.RUnlock()
 
 	overlays[absPath] = params.Content
@@ -816,7 +890,7 @@ func (d *analyzerDaemon) updateTemplate(params daemonUpdateTemplateParams) error
 	}
 	d.overlayMu.Lock()
 	if d.templateOverlays == nil {
-		d.templateOverlays = make(map[string]string)
+		d.templateOverlays = make(map[string]string, 1)
 	}
 	d.templateOverlays[absPath] = params.Content
 	d.overlayMu.Unlock()
@@ -870,11 +944,14 @@ func (d *analyzerDaemon) getHoverInfo(params daemonGetHoverInfoParams) (*validat
 
 	// Load overlays under read lock.
 	d.overlayMu.RLock()
-	overlays := cloneTemplateOverlays(d.templateOverlays)
+	var overlays map[string]string
+	if len(d.templateOverlays) > 0 {
+		overlays = cloneTemplateOverlays(d.templateOverlays)
+	}
 	d.overlayMu.RUnlock()
 
 	content := params.Content
-	if content == "" {
+	if content == "" && len(overlays) > 0 {
 		if overlay, ok := overlays[absPath]; ok {
 			content = overlay
 		}
@@ -956,10 +1033,11 @@ func findRenderVarsForTemplate(
 		return rel, vars, true
 	}
 
+	normalizedAbs := normalizePath(absPath)
 	for key, vars := range renderVarsByTemplate {
 		normalizedKey := normalizeTemplateKey(key)
 		candidateAbs := filepath.Join(templateBase, normalizedKey)
-		if normalizePath(candidateAbs) == normalizePath(absPath) {
+		if normalizePath(candidateAbs) == normalizedAbs {
 			return key, vars, true
 		}
 		if strings.HasSuffix(rel, normalizedKey) || strings.HasSuffix(normalizedKey, rel) {
@@ -1040,7 +1118,7 @@ func replaceRegistryEntriesForFile(registry map[string][]validator.NamedBlockEnt
 // absolute path matches the given file, used to find blocks defined in a template.
 func registryEntriesForFile(registry map[string][]validator.NamedBlockEntry, absolutePath string) []validator.NamedBlockEntry {
 	normalizedPath := normalizePath(absolutePath)
-	entries := make([]validator.NamedBlockEntry, 0)
+	var entries []validator.NamedBlockEntry
 	for _, blockEntries := range registry {
 		for _, entry := range blockEntries {
 			if normalizePath(entry.AbsolutePath) == normalizedPath {
@@ -1069,14 +1147,14 @@ type dedupKey struct {
 // dedupeValidationErrors removes duplicate validation errors by keying on
 // template, line, column, variable, and message.
 func dedupeValidationErrors(in []validator.ValidationResult) []validator.ValidationResult {
-	seen := make(map[dedupKey]bool, len(in))
+	seen := make(map[dedupKey]struct{}, len(in))
 	out := make([]validator.ValidationResult, 0, len(in))
 	for _, err := range in {
 		key := dedupKey{err.Template, err.Line, err.Column, err.Variable, err.Message}
-		if seen[key] {
+		if _, exists := seen[key]; exists {
 			continue
 		}
-		seen[key] = true
+		seen[key] = struct{}{}
 		out = append(out, err)
 	}
 	return out

@@ -209,7 +209,7 @@ func validateTemplateContentWithRegistry(
 		errors = append(errors, validateActionFunctions(action, first, templateName, actualLineNum, col, effectiveFuncMaps)...)
 		errors = append(errors, validateFunctionCallArgTypes(action, first, content, templateName, contentStart, scopeStack, varMap, effectiveFuncMaps)...)
 		extractVariablesFromAction(action, func(v string) {
-			if assignmentTargets[v] {
+			if assignmentTargets != nil && assignmentTargets[v] {
 				return
 			}
 			if err := validateVariableInScope(v, scopeStack, varMap); err != nil {
@@ -491,11 +491,14 @@ func contentHasNamedBlocks(content string) bool {
 }
 
 func assignmentTargetSet(action string) map[string]bool {
-	targets := make(map[string]bool)
+	if !strings.Contains(action, ":=") {
+		return nil
+	}
 	assignmentNames, _, ok := splitAssignment(action)
 	if !ok {
-		return targets
+		return nil
 	}
+	targets := make(map[string]bool, len(assignmentNames))
 	for _, name := range assignmentNames {
 		targets[name] = true
 	}
@@ -503,13 +506,13 @@ func assignmentTargetSet(action string) map[string]bool {
 }
 
 func splitAssignment(action string) ([]string, string, bool) {
-	parts := strings.SplitN(action, ":=", 2)
-	if len(parts) != 2 {
+	lhs, rhs, ok := strings.Cut(action, ":=")
+	if !ok {
 		return nil, "", false
 	}
 
-	lhs := strings.TrimSpace(parts[0])
-	rhs := strings.TrimSpace(parts[1])
+	lhs = strings.TrimSpace(lhs)
+	rhs = strings.TrimSpace(rhs)
 	if lhs == "" || rhs == "" {
 		return nil, "", false
 	}
@@ -531,7 +534,7 @@ func splitAssignment(action string) ([]string, string, bool) {
 }
 
 func registerInlineLocalAssignments(action string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar, funcMaps FuncMapRegistry, templateName string, line int, col int, errors *[]ValidationResult) {
-	if len(scopeStack) == 0 {
+	if len(scopeStack) == 0 || !strings.Contains(action, ":=") {
 		return
 	}
 	assignmentNames, rhs, ok := splitAssignment(action)
@@ -851,15 +854,7 @@ func extractCandidateFromSegment(segment string, segmentIndex int, _ int) string
 // indexOfToken finds the byte offset of token within s using a simple scan.
 // Returns -1 if not found.
 func indexOfToken(s, token string) int {
-	if token == "" || len(token) > len(s) {
-		return -1
-	}
-	for i := 0; i <= len(s)-len(token); i++ {
-		if s[i:i+len(token)] == token {
-			return i
-		}
-	}
-	return -1
+	return strings.Index(s, token)
 }
 
 func isFunctionIdentifier(value string) bool {
@@ -871,12 +866,12 @@ func isFunctionIdentifier(value string) bool {
 	}
 	for index, char := range value {
 		if index == 0 {
-			if !(char == '_' || (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z')) {
+			if char != '_' && (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') {
 				return false
 			}
 			continue
 		}
-		if !(char == '_' || (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9')) {
+		if char != '_' && (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') {
 			return false
 		}
 	}
@@ -900,9 +895,14 @@ func buildRootScope(varMap map[string]ast.TemplateVar) ScopeType {
 		}
 	}
 
+	fieldsCap := len(varMap)
+	if _, hasDot := varMap["."]; hasDot && fieldsCap > 0 {
+		fieldsCap--
+	}
+
 	rootScope := ScopeType{
 		IsRoot: true,
-		Fields: make([]ast.FieldInfo, 0, len(varMap)),
+		Fields: make([]ast.FieldInfo, 0, fieldsCap),
 	}
 
 	for name, v := range varMap {

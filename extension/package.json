@@ -180,11 +180,15 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "npx vsce package",
-    "publish": "npx vsce publish"
+    "publish": "npx vsce publish",
+    "test": "jest"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^20.19.43",
     "@types/vscode": "^1.85.0",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.12",
     "typescript": "^5.3.0"
   }
 }

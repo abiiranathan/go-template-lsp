@@ -697,6 +697,22 @@ export class TypeInferencer {
             }
         }
 
+        // fall back to resolving path[0] directly against top-level vars
+        const rootVar = this.vars.get(path[0]);
+        if (rootVar) {
+            if (path.length === 1) {
+                return {
+                    typeStr: rootVar.type,
+                    fields: rootVar.fields,
+                    isSlice: rootVar.isSlice,
+                    isMap: rootVar.isMap,
+                    elemType: rootVar.elemType,
+                    keyType: rootVar.keyType,
+                };
+            }
+            return this.resolveFieldPath(path.slice(1), rootVar.fields ?? []);
+        }
+
         return null;
     }
 

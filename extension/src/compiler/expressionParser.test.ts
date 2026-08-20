@@ -1,5 +1,5 @@
 /**
- * Comprehensive test suite for the expression parser
+ * Comprehensive test suite for the expression parser.
  */
 
 import { inferExpressionType } from './expressionParser';
@@ -112,7 +112,7 @@ function createTestVars(): Map<string, TemplateVar> {
   ]);
 }
 
-// ── Test Runner ────────────────────────────────────────────────────────────
+// ── Shared Test Case Shape ─────────────────────────────────────────────────
 
 interface TestCase {
   name: string;
@@ -124,85 +124,49 @@ interface TestCase {
   blockLocals?: Map<string, TemplateVar>;
 }
 
-function runTest(tc: TestCase, vars: Map<string, TemplateVar>): boolean {
-  try {
-    const result = inferExpressionType(tc.expr, vars, tc.scope || [], tc.blockLocals);
+/**
+ * Runs inferExpressionType for a single test case and asserts the result
+ * against the case's expectations. Failures surface through Jest's own
+ * matcher diffs, so no manual "Expected/Got" logging is needed here.
+ * @param tc The test case to evaluate.
+ * @param vars The base template variable map (shared fixture across cases).
+ * @param fieldResolver Optional field resolver, used only by the pointer/slice/map suite.
+ */
+function assertExpressionType(
+  tc: TestCase,
+  vars: Map<string, TemplateVar>,
+  fieldResolver?: (typeStr: string) => FieldInfo[] | undefined
+): void {
+  const result = inferExpressionType(
+    tc.expr,
+    vars,
+    tc.scope || [],
+    tc.blockLocals,
+    undefined, // funcMaps
+    fieldResolver
+  );
 
-    if (!result) {
-      console.log(`✗ FAIL: ${tc.name}`);
-      console.log(`  Expression: "${tc.expr}"`);
-      console.log(`  Expected: ${tc.expectedType}`);
-      console.log(`  Got: null`);
-      return false;
-    }
-
-    const typeMatch = result.typeStr === tc.expectedType;
-    const sliceMatch = tc.expectedSlice === undefined || result.isSlice === tc.expectedSlice;
-    const mapMatch = tc.expectedMap === undefined || result.isMap === tc.expectedMap;
-
-    if (typeMatch && sliceMatch && mapMatch) {
-      console.log(`✓ PASS: ${tc.name}`);
-      return true;
-    } else {
-      console.log(`✗ FAIL: ${tc.name}`);
-      console.log(`  Expression: "${tc.expr}"`);
-      console.log(`  Expected: ${tc.expectedType} (slice=${tc.expectedSlice}, map=${tc.expectedMap})`);
-      console.log(`  Got: ${result.typeStr} (slice=${result.isSlice}, map=${result.isMap})`);
-      return false;
-    }
-  } catch (err) {
-    console.log(`✗ ERROR: ${tc.name}`);
-    console.log(`  Expression: "${tc.expr}"`);
-    console.log(`  Error: ${err}`);
-    return false;
+  expect(result).not.toBeNull();
+  expect(result!.typeStr).toBe(tc.expectedType);
+  if (tc.expectedSlice !== undefined) {
+    expect(result!.isSlice).toBe(tc.expectedSlice);
+  }
+  if (tc.expectedMap !== undefined) {
+    expect(result!.isMap).toBe(tc.expectedMap);
   }
 }
 
-// ── Test Suites ────────────────────────────────────────────────────────────
+// ── Shared Fixture ──────────────────────────────────────────────────────────
 
-export function runAllTests() {
-  console.log('╔═════════════════════════════════════════════════════════════╗');
-  console.log('║       Expression Parser Test Suite                          ║');
-  console.log('╚═════════════════════════════════════════════════════════════╝\n');
+let vars: Map<string, TemplateVar>;
 
-  const vars = createTestVars();
-  let totalPassed = 0;
-  let totalFailed = 0;
+beforeEach(() => {
+  vars = createTestVars();
+});
 
-  // Run all test suites
-  const suites = [
-    { name: 'Basic Field Access', fn: testBasicFieldAccess },
-    { name: 'Built-in Functions', fn: testBuiltinFunctions },
-    { name: 'Comparison Operations', fn: testComparisonOps },
-    { name: 'Logical Operations', fn: testLogicalOps },
-    { name: 'Pipeline Operations', fn: testPipelines },
-    { name: 'Collection Operations', fn: testCollections },
-    { name: 'Map Operations', fn: testMapOps },
-    { name: 'Scope and Context', fn: testScopeContext },
-    { name: 'Local Variables', fn: testLocalVariables },
-    { name: 'Complex Expressions', fn: testComplexExpressions },
-    { name: 'Function and Method Calls', fn: testFunctionAndMethodCalls },
-    { name: 'Edge Cases', fn: testEdgeCases },
-    { name: 'Pointer Slice Map Operations', fn: testPointerSliceMapOps },
-  ];
+// ── Suite 1: Basic Field Access ─────────────────────────────────────────────
 
-  for (const suite of suites) {
-    console.log(`\n━━━ ${suite.name} ━━━\n`);
-    const [passed, failed] = suite.fn(vars);
-    totalPassed += passed;
-    totalFailed += failed;
-  }
-
-  console.log('\n╔═════════════════════════════════════════════════════════════╗');
-  console.log(`║ Total: ${totalPassed} passed, ${totalFailed} failed`.padEnd(62) + '║');
-  console.log('╚═════════════════════════════════════════════════════════════╝\n');
-
-  return { passed: totalPassed, failed: totalFailed };
-}
-
-// ── Test Suite 1: Basic Field Access ──────────────────────────────────────
-
-function testBasicFieldAccess(vars: Map<string, TemplateVar>): [number, number] {
+describe('Basic Field Access', () => {
   const tests: TestCase[] = [
     { name: 'Bare dot', expr: '.', expectedType: 'context' },
     { name: 'Simple field', expr: '.Count', expectedType: 'int' },
@@ -214,20 +178,14 @@ function testBasicFieldAccess(vars: Map<string, TemplateVar>): [number, number] 
     { name: 'Map field', expr: '.Config', expectedType: 'map[string]interface{}', expectedMap: true },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 2: Built-in Functions ──────────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 2: Built-in Functions ──────────────────────────────────────
-
-function testBuiltinFunctions(vars: Map<string, TemplateVar>): [number, number] {
+describe('Built-in Functions', () => {
   const tests: TestCase[] = [
     { name: 'len on slice', expr: 'len .Items', expectedType: 'int' },
     { name: 'len on map', expr: 'len .Config', expectedType: 'int' },
@@ -243,20 +201,14 @@ function testBuiltinFunctions(vars: Map<string, TemplateVar>): [number, number] 
     { name: 'urlquery escape', expr: 'urlquery .User.Email', expectedType: 'string' },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 3: Comparison Operations ──────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 3: Comparison Operations ───────────────────────────────────
-
-function testComparisonOps(vars: Map<string, TemplateVar>): [number, number] {
+describe('Comparison Operations', () => {
   const tests: TestCase[] = [
     { name: 'eq comparison', expr: 'eq .Count 10', expectedType: 'bool' },
     { name: 'ne comparison', expr: 'ne .Count 0', expectedType: 'bool' },
@@ -268,20 +220,14 @@ function testComparisonOps(vars: Map<string, TemplateVar>): [number, number] {
     { name: 'nested eq', expr: 'eq (len .Items) 5', expectedType: 'bool' },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 4: Logical Operations ─────────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 4: Logical Operations ──────────────────────────────────────
-
-function testLogicalOps(vars: Map<string, TemplateVar>): [number, number] {
+describe('Logical Operations', () => {
   const tests: TestCase[] = [
     { name: 'not operation', expr: 'not .Active', expectedType: 'bool' },
     { name: 'and operation', expr: 'and .Active (gt .Count 0)', expectedType: 'bool' },
@@ -291,80 +237,56 @@ function testLogicalOps(vars: Map<string, TemplateVar>): [number, number] {
     { name: 'complex logical', expr: 'and (not .Active) (gt .Count 5)', expectedType: 'bool' },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 5: Pipeline Operations ────────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 5: Pipeline Operations ─────────────────────────────────────
-
-function testPipelines(vars: Map<string, TemplateVar>): [number, number] {
+describe('Pipeline Operations', () => {
   const tests: TestCase[] = [
     { name: 'Simple pipe', expr: '.Count | printf "%d"', expectedType: 'string' },
     { name: 'Multi-stage pipe', expr: '.Items | len | printf "%d"', expectedType: 'string' },
     { name: 'Pipe with comparison', expr: '.Count | gt 10', expectedType: 'bool' },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 6: Collection Operations ──────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 6: Collection Operations ───────────────────────────────────
-
-function testCollections(vars: Map<string, TemplateVar>): [number, number] {
+describe('Collection Operations', () => {
   const tests: TestCase[] = [
     { name: 'Slice access', expr: 'index .Items 0', expectedType: 'Item' },
     { name: 'Slice length', expr: 'len .Items', expectedType: 'int' },
     { name: 'Slice operation', expr: 'slice .Items 1 3', expectedType: '[]Item' },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 7: Map Operations ─────────────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 7: Map Operations ──────────────────────────────────────────
-
-function testMapOps(vars: Map<string, TemplateVar>): [number, number] {
+describe('Map Operations', () => {
   const tests: TestCase[] = [
     { name: 'Map index', expr: 'index .Config "key"', expectedType: 'interface{}' },
     { name: 'Map length', expr: 'len .Config', expectedType: 'int' },
     { name: 'String map index', expr: 'index .Settings "theme"', expectedType: 'string' },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 8: Scope and Context ──────────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 8: Scope and Context ───────────────────────────────────────
-
-function testScopeContext(vars: Map<string, TemplateVar>): [number, number] {
+describe('Scope and Context', () => {
   const itemFields: FieldInfo[] = [
     { name: 'Name', type: 'string', isSlice: false },
     { name: 'Price', type: 'float64', isSlice: false },
@@ -384,20 +306,14 @@ function testScopeContext(vars: Map<string, TemplateVar>): [number, number] {
     { name: 'Root access inside scope', expr: '$.User.Name', expectedType: 'string', scope },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 9: Local Variables ────────────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 9: Local Variables ─────────────────────────────────────────
-
-function testLocalVariables(vars: Map<string, TemplateVar>): [number, number] {
+describe('Local Variables', () => {
   const blockLocals = new Map<string, TemplateVar>([
     ['$item', {
       name: '$item',
@@ -430,20 +346,14 @@ function testLocalVariables(vars: Map<string, TemplateVar>): [number, number] {
     { name: 'Mix root and local', expr: 'eq $.Count $idx', expectedType: 'bool', blockLocals },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 10: Complex Expressions ───────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 10: Complex Expressions ────────────────────────────────────
-
-function testComplexExpressions(vars: Map<string, TemplateVar>): [number, number] {
+describe('Complex Expressions', () => {
   const tests: TestCase[] = [
     {
       name: 'Nested function calls',
@@ -469,23 +379,17 @@ function testComplexExpressions(vars: Map<string, TemplateVar>): [number, number
       name: 'Complex logical with fields',
       expr: 'and (eq .User.Profile.Bio "") (not .Active)',
       expectedType: 'bool',
-    }
+    },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 11: Function and Method Calls ─────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 11: Function and Method Calls ──────────────────────────────
-
-function testFunctionAndMethodCalls(vars: Map<string, TemplateVar>): [number, number] {
+describe('Function and Method Calls', () => {
   const blockLocals = new Map<string, TemplateVar>([
     ['$role', { name: '$role', type: 'string', isSlice: false }],
     ['$getDiscount', { name: '$getDiscount', type: 'func() float64', isSlice: false }],
@@ -517,40 +421,28 @@ function testFunctionAndMethodCalls(vars: Map<string, TemplateVar>): [number, nu
     { name: 'Method call with variable arg', expr: '.User.HasRole $role', expectedType: 'bool', blockLocals },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 12: Edge Cases ─────────────────────────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 12: Edge Cases ─────────────────────────────────────────────
-
-function testEdgeCases(vars: Map<string, TemplateVar>): [number, number] {
+describe('Edge Cases', () => {
   const tests: TestCase[] = [
     { name: 'String literal', expr: '"hello world"', expectedType: 'string' },
     { name: 'Number literal', expr: '42', expectedType: 'int' },
     { name: 'Parenthesized expression', expr: '(gt .Count 5)', expectedType: 'bool' },
   ];
 
-  let passed = 0;
-  let failed = 0;
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars);
+  });
+});
 
-  for (const tc of tests) {
-    if (runTest(tc, vars)) passed++;
-    else failed++;
-  }
+// ── Suite 13: Pointer Slice Map Operations ──────────────────────────────────
 
-  return [passed, failed];
-}
-
-// ── Test Suite 13: Pointer Slice Map Operations ───────────────────────────
-
-function testPointerSliceMapOps(vars: Map<string, TemplateVar>): [number, number] {
+describe('Pointer Slice Map Operations', () => {
   // Simulates:
   //   {{ range .visitIDS }}
   //     {{ $visitId := . }}
@@ -560,11 +452,11 @@ function testPointerSliceMapOps(vars: Map<string, TemplateVar>): [number, number
   //   {{ end }}
 
   // fieldResolver that knows Payment has Amount and Reference fields.
-  const paymentFields = [
+  const paymentFields: FieldInfo[] = [
     { name: 'Amount', type: 'float64', isSlice: false },
     { name: 'Reference', type: 'string', isSlice: false },
   ];
-  const fieldResolver = (typeStr: string) => {
+  const fieldResolver = (typeStr: string): FieldInfo[] | undefined => {
     if (typeStr === 'Payment') return paymentFields;
     return undefined;
   };
@@ -575,7 +467,7 @@ function testPointerSliceMapOps(vars: Map<string, TemplateVar>): [number, number
       name: '$paymentSlice',
       type: '[]*Payment',
       isSlice: true,
-      elemType: 'Payment',   // pointer already stripped by the inferencer
+      elemType: 'Payment', // pointer already stripped by the inferencer
     }],
   ]);
 
@@ -642,56 +534,7 @@ function testPointerSliceMapOps(vars: Map<string, TemplateVar>): [number, number
     },
   ];
 
-  let passed = 0;
-  let failed = 0;
-
-  // Pass the fieldResolver so Payment fields are resolvable.
-  for (const tc of tests) {
-    try {
-      const result = inferExpressionType(
-        tc.expr, vars, tc.scope || [], tc.blockLocals,
-        undefined,   // funcMaps
-        fieldResolver
-      );
-
-      if (!result) {
-        console.log(`✗ FAIL: ${tc.name}`);
-        console.log(`  Expression: "${tc.expr}"`);
-        console.log(`  Expected: ${tc.expectedType}`);
-        console.log(`  Got: null`);
-        failed++;
-        continue;
-      }
-
-      const typeMatch = result.typeStr === tc.expectedType;
-      const sliceMatch = tc.expectedSlice === undefined || result.isSlice === tc.expectedSlice;
-      const mapMatch = tc.expectedMap === undefined || result.isMap === tc.expectedMap;
-
-      if (typeMatch && sliceMatch && mapMatch) {
-        console.log(`✓ PASS: ${tc.name}`);
-        passed++;
-      } else {
-        console.log(`✗ FAIL: ${tc.name}`);
-        console.log(`  Expression: "${tc.expr}"`);
-        console.log(`  Expected: ${tc.expectedType} (slice=${tc.expectedSlice}, map=${tc.expectedMap})`);
-        console.log(`  Got:      ${result.typeStr} (slice=${result.isSlice}, map=${result.isMap})`);
-        failed++;
-      }
-    } catch (err) {
-      console.log(`✗ ERROR: ${tc.name}`);
-      console.log(`  Expression: "${tc.expr}"`);
-      console.log(`  Error: ${err}`);
-      failed++;
-    }
-  }
-
-  return [passed, failed];
-}
-
-
-// ── Main Entry Point ───────────────────────────────────────────────────────
-
-if (require.main === module) {
-  const result = runAllTests();
-  process.exit(result.failed > 0 ? 1 : 0);
-}
+  test.each(tests)('$name', (tc) => {
+    assertExpressionType(tc, vars, fieldResolver);
+  });
+});

@@ -12,7 +12,8 @@
     "esModuleInterop": true,
     "types": [
       "node",
-      "vscode"
+      "vscode",
+      "jest"
     ]
   },
   "exclude": [

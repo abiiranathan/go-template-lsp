@@ -599,7 +599,8 @@ export function resolvePath(
             return { typeStr: 'any', found: true };
         }
         if (!isNaN(Number(path[0]))) {
-            return { typeStr: 'float64', found: true };
+            const num = Number(path[0]);
+            return { typeStr: Number.isInteger(num) ? 'int' : 'float64', found: true };
         }
         if (path[0].startsWith('"') || path[0].startsWith('`')) {
             return { typeStr: 'string', found: true };

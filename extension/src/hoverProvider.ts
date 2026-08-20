@@ -261,16 +261,29 @@ export class HoverProvider {
         locals?: Map<string, TemplateVar>,
         rawText?: string
     ): vscode.Hover {
+
+        const isLiteral = path.length === 1 && (
+            !isNaN(Number(path[0])) ||
+            path[0] === 'true' ||
+            path[0] === 'false' ||
+            path[0] === 'nil' ||
+            path[0].startsWith('"') ||
+            path[0].startsWith('`')
+        );
+
         const varName =
-            rawText && path.length <= 1 && (path[0] === 'expression' || path[0] === 'unknown' || path.length === 0)
-                ? rawText
-                : path.length > 0 && path[0] === '.'
-                    ? '.'
-                    : path.length > 0 && path[0] === '$'
-                        ? '$.' + path.slice(1).join('.')
-                        : path.length > 0 && path[0].startsWith('$')
-                            ? path.join('.')
-                            : '.' + path.join('.');
+            isLiteral
+                ? path[0]
+                : rawText && path.length <= 1 && (path[0] === 'expression' || path[0] === 'unknown' || path.length === 0)
+                    ? rawText
+                    : path.length > 0 && path[0] === '.'
+                        ? '.'
+                        : path.length > 0 && path[0] === '$'
+                            ? '$.' + path.slice(1).join('.')
+                            : path.length > 0 && path[0].startsWith('$')
+                                ? path.join('.')
+                                : '.' + path.join('.');
+
 
         const md = new vscode.MarkdownString();
         md.isTrusted = true;

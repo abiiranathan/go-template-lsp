@@ -111,6 +111,9 @@ export class GoAnalyzer {
    * cwd is set to workspaceRoot so relative paths in output stay predictable.
    */
   async analyzeWorkspace(workspaceRoot: string): Promise<AnalysisResult> {
+    const params = this.buildAnalyzeParams(workspaceRoot);
+    this.outputChannel.appendLine(`[Analyzer] analyze params: ${JSON.stringify(params)}`);
+
     try {
       const result = await this.sendDaemonRequest<AnalysisResult>(workspaceRoot, 'analyze', this.buildAnalyzeParams(workspaceRoot));
       this.outputChannel.appendLine(

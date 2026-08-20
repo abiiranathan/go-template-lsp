@@ -308,7 +308,7 @@ func (i expressionInferencer) checkCommandArgTypes(funcName string, rawArgs []te
 			continue
 		}
 
-		if typesCompatible(expected, arg) {
+		if TypesCompatible(expected, arg, i.typeRegistry) {
 			continue
 		}
 
@@ -334,23 +334,29 @@ func (i expressionInferencer) checkCommandArgTypes(funcName string, rawArgs []te
 	return mismatches
 }
 
-// typesCompatible reports whether an inferred argument type can satisfy the
+// TypesCompatible reports whether an inferred argument type can satisfy the
 // declared parameter type. It is intentionally lenient to avoid false positives:
 // unknown, any, context, and nil arguments are always accepted, pointers are
 // unwrapped, and the numeric family is treated as compatible (template number
-// literals are untyped constants).
-func typesCompatible(expected string, actual *ExpressionTypeResult) bool {
+// literals are untyped constants). It also supports defined types with underlying
+// basic types (e.g. type Permission int accepting int, 1, or Permission).
+func TypesCompatible(expected string, actual *ExpressionTypeResult, typeRegistry ...map[string][]ast.FieldInfo) bool {
 	if actual == nil {
 		return true
 	}
 	expected = strings.TrimSpace(expected)
 	expected = strings.TrimPrefix(expected, "...") // Trim ... from variadic types.
 	actualStr := strings.TrimSpace(actual.TypeStr)
-	if expected == "" || expected == "any" || expected == "interface{}" {
+	if expected == "" || isAnyOrInterfaceType(expected) {
 		return true
 	}
-	if actualStr == "" || actualStr == "any" || actualStr == "interface{}" || actualStr == "unknown" || actualStr == "context" || actualStr == "nil" {
+	if actualStr == "" || isAnyOrInterfaceType(actualStr) || actualStr == "unknown" || actualStr == "context" {
 		return true
+	}
+
+	// Untyped nil is compatible with pointers, slices, maps, funcs, channels, interfaces, errors
+	if actualStr == "nil" {
+		return isNillableTypeName(expected)
 	}
 
 	// Unwrap pointer prefixes on both sides.
@@ -359,6 +365,11 @@ func typesCompatible(expected string, actual *ExpressionTypeResult) bool {
 
 	if exp == act {
 		return true
+	}
+
+	var reg map[string][]ast.FieldInfo
+	if len(typeRegistry) > 0 {
+		reg = typeRegistry[0]
 	}
 
 	expIsSlice := strings.HasPrefix(exp, "[]")
@@ -371,28 +382,294 @@ func typesCompatible(expected string, actual *ExpressionTypeResult) bool {
 	}
 
 	if expIsSlice {
-		return typesCompatible(unwrapCollectionElemType(exp), &ExpressionTypeResult{TypeStr: unwrapCollectionElemType(act)})
+		return TypesCompatible(unwrapCollectionElemType(exp), &ExpressionTypeResult{TypeStr: unwrapCollectionElemType(act)}, reg)
 	}
 
 	if expIsMap {
-		if !typesCompatible(unwrapMapKeyType(exp), &ExpressionTypeResult{TypeStr: unwrapMapKeyType(act)}) {
+		if !TypesCompatible(unwrapMapKeyType(exp), &ExpressionTypeResult{TypeStr: unwrapMapKeyType(act)}, reg) {
 			return false
 		}
-		return typesCompatible(unwrapCollectionElemType(exp), &ExpressionTypeResult{TypeStr: unwrapCollectionElemType(act)})
+		return TypesCompatible(unwrapCollectionElemType(exp), &ExpressionTypeResult{TypeStr: unwrapCollectionElemType(act)}, reg)
 	}
 
-	// Untyped numeric constants in templates allow cross int/float arguments.
-	if isNumericTypeName(exp) && isNumericTypeName(act) {
+	// Compare package-unqualified bare names (e.g. models.User == User, main.Permission == Permission)
+	bareExp := stripPackageName(extractBareType(exp))
+	bareAct := stripPackageName(extractBareType(act))
+	if bareExp == bareAct && bareExp != "" {
+		return true
+	}
+
+	// Untyped numeric constants in templates allow cross int/float arguments, as well as
+	// defined scalar types with numeric underlying types (e.g. type Permission int <-> int).
+	if isNumericOrConvertibleTypeName(exp, act, reg) {
+		return true
+	}
+
+	// String family & string-like defined types (e.g. type Status string, template.HTML, []byte).
+	if isStringOrConvertibleTypeName(exp, act, reg) {
+		return true
+	}
+
+	// Bool family & bool-like defined types (e.g. type MyFlag bool).
+	if isBoolOrConvertibleTypeName(exp, act, reg) {
 		return true
 	}
 
 	// Both named types: compare the bare type names.
 	if !isPrimitiveTypeName(exp) && !isPrimitiveTypeName(act) {
-		return extractBareType(exp) == extractBareType(act)
+		return bareExp == bareAct
 	}
 
 	// One side is primitive and the other is not (or both are distinct primitives).
 	return false
+}
+
+func isAnyOrInterfaceType(t string) bool {
+	t = strings.TrimSpace(t)
+	return t == "any" || t == "interface{}" || t == "interface {}" || t == ""
+}
+
+func isNillableTypeName(t string) bool {
+	t = strings.TrimSpace(t)
+	return strings.HasPrefix(t, "*") ||
+		strings.HasPrefix(t, "[]") ||
+		strings.HasPrefix(t, "map[") ||
+		strings.HasPrefix(t, "func(") ||
+		strings.HasPrefix(t, "chan ") ||
+		isAnyOrInterfaceType(t) ||
+		t == "error"
+}
+
+func stripPackageName(typeStr string) string {
+	typeStr = strings.TrimSpace(typeStr)
+	if idx := strings.LastIndexByte(typeStr, '.'); idx != -1 {
+		return typeStr[idx+1:]
+	}
+	return typeStr
+}
+
+func isStructTypeName(t string, typeRegistry map[string][]ast.FieldInfo) bool {
+	if len(typeRegistry) == 0 {
+		return false
+	}
+	bare := stripPackageName(extractBareType(t))
+	if fields, ok := typeRegistry[bare]; ok && len(fields) > 0 {
+		return true
+	}
+	for k, fields := range typeRegistry {
+		if stripPackageName(k) == bare && len(fields) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func isCompositeTypeName(t string) bool {
+	t = strings.TrimSpace(t)
+	return strings.HasPrefix(t, "[]") ||
+		strings.HasPrefix(t, "map[") ||
+		strings.HasPrefix(t, "func(") ||
+		strings.HasPrefix(t, "chan ") ||
+		strings.HasPrefix(t, "struct")
+}
+
+var basicNumericTypes = map[string]bool{
+	"int":           true,
+	"int8":          true,
+	"int16":         true,
+	"int32":         true,
+	"int64":         true,
+	"uint":          true,
+	"uint8":         true,
+	"uint16":        true,
+	"uint32":        true,
+	"uint64":        true,
+	"uintptr":       true,
+	"float32":       true,
+	"float64":       true,
+	"complex64":     true,
+	"complex128":    true,
+	"byte":          true,
+	"rune":          true,
+	"number":        true,
+	"untyped int":   true,
+	"untyped float": true,
+}
+
+var knownNumericKeywords = map[string]bool{
+	"Permission":  true,
+	"Permissions": true,
+	"Role":        true,
+	"Roles":       true,
+	"ID":          true,
+	"Id":          true,
+	"UID":         true,
+	"GID":         true,
+	"Count":       true,
+	"Total":       true,
+	"Size":        true,
+	"Offset":      true,
+	"Index":       true,
+	"Duration":    true,
+	"Time":        true,
+	"Timestamp":   true,
+	"Code":        true,
+	"StatusCode":  true,
+	"Flag":        true,
+	"Flags":       true,
+	"Level":       true,
+	"Priority":    true,
+	"Mode":        true,
+	"Port":        true,
+	"Age":         true,
+	"Score":       true,
+	"Price":       true,
+	"Amount":      true,
+	"Quantity":    true,
+}
+
+func isKnownNumericName(t string) bool {
+	bare := stripPackageName(extractBareType(t))
+	if basicNumericTypes[bare] || knownNumericKeywords[bare] {
+		return true
+	}
+	for _, suffix := range []string{"ID", "Id", "Count", "Size", "Duration", "Code", "Flags", "Flag", "Level", "Num", "Number", "Int", "Int64", "Uint", "Uint64", "Float", "Float64"} {
+		if strings.HasSuffix(bare, suffix) && len(bare) > len(suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+var knownStringTypes = map[string]bool{
+	"string":            true,
+	"untyped string":    true,
+	"[]byte":            true,
+	"[]rune":            true,
+	"HTML":              true,
+	"HTMLAttr":          true,
+	"CSS":               true,
+	"JS":                true,
+	"JSStr":             true,
+	"URL":               true,
+	"Srcset":            true,
+	"template.HTML":     true,
+	"template.HTMLAttr": true,
+	"template.CSS":      true,
+	"template.JS":       true,
+	"template.JSStr":    true,
+	"template.URL":      true,
+	"template.Srcset":   true,
+	"Status":            true,
+	"UserStatus":        true,
+	"Slug":              true,
+	"Title":             true,
+	"Description":       true,
+	"Summary":           true,
+	"Message":           true,
+	"Body":              true,
+	"Email":             true,
+	"UUID":              true,
+	"Token":             true,
+	"Address":           true,
+	"City":              true,
+	"Country":           true,
+	"IP":                true,
+	"Host":              true,
+	"URLString":         true,
+	"Query":             true,
+	"Text":              true,
+	"Path":              true,
+	"Content":           true,
+	"Comment":           true,
+	"Tag":               true,
+	"Label":             true,
+}
+
+func isKnownStringName(t string) bool {
+	bare := stripPackageName(extractBareType(t))
+	if knownStringTypes[bare] || knownStringTypes[t] {
+		return true
+	}
+	for _, suffix := range []string{"Status", "Name", "Title", "Slug", "Email", "Token", "Path", "URL", "HTML", "Text", "Message", "Str", "String"} {
+		if strings.HasSuffix(bare, suffix) && len(bare) > len(suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isKnownBoolName(t string) bool {
+	bare := stripPackageName(extractBareType(t))
+	if bare == "bool" || bare == "untyped bool" {
+		return true
+	}
+	for _, prefix := range []string{"Is", "Has", "Can", "Should", "Allow", "Enable"} {
+		if strings.HasPrefix(bare, prefix) && len(bare) > len(prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNumericOrConvertibleTypeName(exp, act string, typeRegistry map[string][]ast.FieldInfo) bool {
+	expBare := stripPackageName(extractBareType(exp))
+	actBare := stripPackageName(extractBareType(act))
+
+	if isCompositeTypeName(expBare) || isCompositeTypeName(actBare) {
+		return false
+	}
+	if isStructTypeName(expBare, typeRegistry) || isStructTypeName(actBare, typeRegistry) {
+		return false
+	}
+	if isKnownStringName(expBare) || isKnownStringName(actBare) {
+		return false
+	}
+	if expBare == "bool" || actBare == "bool" || expBare == "error" || actBare == "error" {
+		return false
+	}
+
+	return isKnownNumericName(expBare) && isKnownNumericName(actBare)
+}
+
+func isStringOrConvertibleTypeName(exp, act string, typeRegistry map[string][]ast.FieldInfo) bool {
+	expBare := stripPackageName(extractBareType(exp))
+	actBare := stripPackageName(extractBareType(act))
+
+	if isCompositeTypeName(expBare) || isCompositeTypeName(actBare) {
+		return false
+	}
+	if isStructTypeName(expBare, typeRegistry) || isStructTypeName(actBare, typeRegistry) {
+		return false
+	}
+	if isKnownNumericName(expBare) || isKnownNumericName(actBare) {
+		return false
+	}
+	if expBare == "bool" || actBare == "bool" || expBare == "error" || actBare == "error" {
+		return false
+	}
+
+	return isKnownStringName(expBare) && isKnownStringName(actBare)
+}
+
+func isBoolOrConvertibleTypeName(exp, act string, typeRegistry map[string][]ast.FieldInfo) bool {
+	expBare := stripPackageName(extractBareType(exp))
+	actBare := stripPackageName(extractBareType(act))
+
+	if isCompositeTypeName(expBare) || isCompositeTypeName(actBare) {
+		return false
+	}
+	if isStructTypeName(expBare, typeRegistry) || isStructTypeName(actBare, typeRegistry) {
+		return false
+	}
+	if isKnownNumericName(expBare) || isKnownNumericName(actBare) {
+		return false
+	}
+	if isKnownStringName(expBare) || isKnownStringName(actBare) {
+		return false
+	}
+
+	return isKnownBoolName(expBare) && isKnownBoolName(actBare)
 }
 
 // stripAssignmentPrefix removes a leading "{{ $x := ... }}" / "{{ $a, $b := ... }}"
@@ -425,7 +702,7 @@ func (i expressionInferencer) inferNode(node templateparse.Node) *ExpressionType
 	case *templateparse.StringNode:
 		return &ExpressionTypeResult{TypeStr: "string", Literal: typed.Text}
 	case *templateparse.NumberNode:
-		if typed.IsInt {
+		if typed.IsInt || typed.IsUint {
 			return &ExpressionTypeResult{TypeStr: "int"}
 		}
 		return &ExpressionTypeResult{TypeStr: "float64"}

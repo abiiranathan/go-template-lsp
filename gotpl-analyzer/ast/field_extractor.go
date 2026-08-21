@@ -94,11 +94,14 @@ func extractFieldsUncachedDepth(
 ) ([]FieldInfo, string) {
 	strct, ok := named.Underlying().(*types.Struct)
 	if !ok {
+		fields := extractMethodFields(named, structIndex, fc, seen, fset, depth)
 		doc := ""
 		if entry, exists := structIndex[astKey]; exists {
 			doc = entry.doc
+			addMethodDocs(fields, entry)
 		}
-		return extractMethodFields(named, fset), doc
+		resolveExternalMethodDocs(fields)
+		return fields, doc
 	}
 
 	entry := structIndex[astKey]
@@ -112,8 +115,9 @@ func extractFieldsUncachedDepth(
 	}
 
 	fields := extractStructFieldsDepth(strct, entry, structIndex, fc, seen, fset, depth)
-	fields = append(fields, extractMethodFields(named, fset)...)
+	fields = append(fields, extractMethodFields(named, structIndex, fc, seen, fset, depth)...)
 	addMethodDocs(fields, entry)
+	resolveExternalMethodDocs(fields)
 
 	return fields, doc
 }
@@ -207,18 +211,19 @@ func buildFieldInfoDepth(
 }
 
 // extractMethodFields extracts exported methods as FieldInfo entries.
+//
+// Return types are expanded via extractSignatureInfoWithFields so the types
+// reachable only through method results (e.g. a getter returning a struct from
+// another package) still make it into the global type registry; expansion is
+// bounded by MaxFieldDepth, seen-map cycle protection, and the field cache.
 func extractMethodFields(
 	named *types.Named,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seen map[string]bool,
 	fset *token.FileSet,
+	depth int,
 ) []FieldInfo {
-	// If the type belongs to standard library (e.g. time.Time), skip heavy method tree recursion
-	if named.Obj() != nil && named.Obj().Pkg() != nil {
-		pkgPath := named.Obj().Pkg().Path()
-		if !strings.Contains(pkgPath, ".") { // stdlib packages don't have '.' in their path
-			return nil
-		}
-	}
-
 	var methodSet *types.MethodSet
 	if _, isInterface := named.Underlying().(*types.Interface); isInterface {
 		methodSet = types.NewMethodSet(named)
@@ -243,7 +248,7 @@ func extractMethodFields(
 		}
 
 		if sig, ok := method.Type().(*types.Signature); ok {
-			fi.Params, fi.Returns, _ = extractSignatureInfoWithFields(sig)
+			fi.Params, fi.Returns, _ = extractSignatureInfoWithFields(sig, structIndex, fc, seen, fset, depth+1)
 		}
 
 		if pos := method.Pos(); pos.IsValid() && fset != nil {
@@ -259,16 +264,26 @@ func extractMethodFields(
 	return fields
 }
 
-// extractSignatureInfoWithFields extracts signature info without recursively
-// expanding return type struct fields to avoid exponential explosion.
-func extractSignatureInfoWithFields(sig *types.Signature) (params, returns []ParamInfo, args []string) {
+// extractSignatureInfoWithFields extracts signature info and recursively
+// extracts the struct fields for any returned types so they can be registered
+// in the global type registry. Expansion is bounded by depth, the seen set,
+// and the field cache.
+func extractSignatureInfoWithFields(
+	sig *types.Signature,
+	structIndex map[string]structIndexEntry,
+	fc *fieldCache,
+	seen map[string]bool,
+	fset *token.FileSet,
+	depth int,
+) (params, returns []ParamInfo, args []string) {
 	params, returns, args = extractSignatureInfo(sig)
 
-	// DO NOT recursively call extractFieldsWithDocsDepth on return types.
-	// Return types are resolved through the global Types registry on demand.
 	for i := 0; i < sig.Results().Len(); i++ {
 		rt := sig.Results().At(i).Type()
-		returns[i].TypeStr = normalizeTypeStr(rt)
+		elemSeen := copySeenMap(seen)
+		fields, doc := extractFieldsWithDocsDepth(rt, structIndex, fc, elemSeen, fset, depth)
+		returns[i].Fields = fields
+		returns[i].Doc = doc
 	}
 
 	return
@@ -291,6 +306,19 @@ func addMethodDocs(fields []FieldInfo, entry structIndexEntry) {
 			if fi.Doc == "" {
 				fi.Doc = pos.doc
 			}
+		}
+	}
+}
+
+// resolveExternalMethodDocs fills in doc comments for methods that the project
+// struct index has no entry for, i.e. methods of external types (stdlib,
+// module dependencies). The doc is read from the declaring source file, whose
+// position was recorded during method extraction.
+func resolveExternalMethodDocs(fields []FieldInfo) {
+	for i := range fields {
+		fi := &fields[i]
+		if fi.TypeStr == "method" && fi.Doc == "" && fi.DefFile != "" {
+			fi.Doc = funcDocAt(fi.DefFile, fi.DefLine)
 		}
 	}
 }

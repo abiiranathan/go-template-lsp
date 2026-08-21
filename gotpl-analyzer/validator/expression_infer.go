@@ -2,9 +2,9 @@ package validator
 
 import (
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"text/template"
 	templateparse "text/template/parse"
 
@@ -48,8 +48,33 @@ type expressionInferencer struct {
 	blockLocals  map[string]ast.TemplateVar
 	funcMaps     FuncMapRegistry
 	typeRegistry map[string][]ast.FieldInfo
+
+	// rootFields lazily caches the root scope field list derived from vars,
+	// which is fixed for the lifetime of the inferencer; building it per
+	// expression node dominated allocation counts on large templates.
+	rootFields []ast.FieldInfo
+	hasRoot    bool
 }
 
+// rootScopeFields returns the cached root scope derived from vars, building it
+// on first use. i.vars is read-only for the inferencer's lifetime, so the
+// derived scope is computed at most once per inferencer.
+func (i *expressionInferencer) rootScopeFields() []ast.FieldInfo {
+	if !i.hasRoot {
+		i.rootFields = buildRootScope(i.vars).Fields
+		i.hasRoot = true
+	}
+	return i.rootFields
+}
+
+// InferExpressionType resolves the Go type of a single template expression
+// using the provided variable context, scope stack, block locals, function map
+// registry, and type registry. It returns nil when the expression cannot be
+// resolved.
+//
+// All maps and slices passed in are treated as strictly read-only and are
+// never mutated nor retained beyond the call, so callers may share them
+// freely, including concurrently across goroutines.
 func InferExpressionType(
 	expr string,
 	vars map[string]ast.TemplateVar,
@@ -59,16 +84,16 @@ func InferExpressionType(
 	typeRegistry map[string][]ast.FieldInfo,
 ) *ExpressionTypeResult {
 	inferencer := expressionInferencer{
-		vars:         cloneTemplateVarMap(vars),
-		scopeStack:   cloneScopeStack(scopeStack),
-		blockLocals:  cloneTemplateVarMap(blockLocals),
-		funcMaps:     maps.Clone(funcMaps),
-		typeRegistry: maps.Clone(typeRegistry),
+		vars:         vars,
+		scopeStack:   scopeStack,
+		blockLocals:  blockLocals,
+		funcMaps:     funcMaps,
+		typeRegistry: typeRegistry,
 	}
 	return inferencer.infer(expr)
 }
 
-func (i expressionInferencer) infer(expr string) *ExpressionTypeResult {
+func (i *expressionInferencer) infer(expr string) *ExpressionTypeResult {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
 		return nil
@@ -95,7 +120,7 @@ func (i expressionInferencer) infer(expr string) *ExpressionTypeResult {
 }
 
 // collectLocalVarNames returns all $var names from blockLocals and scopeStack Locals.
-func (i expressionInferencer) collectLocalVarNames() []string {
+func (i *expressionInferencer) collectLocalVarNames() []string {
 	seen := make(map[string]struct{})
 	for name := range i.blockLocals {
 		if strings.HasPrefix(name, "$") && name != "$" {
@@ -113,16 +138,58 @@ func (i expressionInferencer) collectLocalVarNames() []string {
 	for name := range seen {
 		names = append(names, name)
 	}
+	// Deterministic order keeps the generated pre-declaration prefix and the
+	// expression tree cache key stable across calls for the same variable set.
+	slices.Sort(names)
 	return names
 }
 
+// exprHelperFuncNames are the template helper functions pre-declared for
+// every parsed expression so that common pipeline helpers resolve at parse time.
+var exprHelperFuncNames = []string{"dict", "add", "sub", "mul", "div", "mod"}
+
+// maxExprTreeCacheEntries bounds the expression parse-tree cache. Trees are
+// small (a few KB each), so the cap keeps the cache in the low single-digit
+// megabytes even for long-lived daemon sessions.
+const maxExprTreeCacheEntries = 4096
+
+// cachedExprTree is a parsed expression tree stored alongside the exact
+// function-name set of the registry it was parsed with. A cached tree may only
+// be reused when the caller's registry exposes this same name set, since the
+// template parser rejects calls to undefined functions.
+type cachedExprTree struct {
+	tree *templateparse.Tree
+	// regNames is the sorted key set of the FuncMapRegistry the tree was
+	// built from, excluding the constant exprHelperFuncNames.
+	regNames []string
+}
+
+// exprTreeCache memoizes parsed expression trees. The same expression text is
+// typically inferred many times across templates and repeated validateTemplate
+// requests, and each parse otherwise rebuilds a full stub FuncMap plus a fresh
+// parse tree. Entries are pure derived data: eviction never changes results,
+// only re-parses. Safe for concurrent use.
+var (
+	exprTreeCacheMu sync.Mutex
+	exprTreeCache   = make(map[string]cachedExprTree)
+)
+
 func parseExpressionTree(expr string, funcMaps FuncMapRegistry, localVarNames []string) (*templateparse.Tree, error) {
-	funcDefs := template.FuncMap{}
-	for _, name := range []string{"dict", "add", "sub", "mul", "div", "mod"} {
-		funcDefs[name] = func(...any) any { return nil }
+	key := exprTreeCacheKey(expr, localVarNames)
+
+	exprTreeCacheMu.Lock()
+	cached, ok := exprTreeCache[key]
+	exprTreeCacheMu.Unlock()
+	if ok && cached.matches(funcMaps) {
+		return cached.tree, nil
+	}
+
+	funcDefs := make(template.FuncMap, len(funcMaps)+len(exprHelperFuncNames))
+	for _, name := range exprHelperFuncNames {
+		funcDefs[name] = noopFunc
 	}
 	for name := range funcMaps {
-		funcDefs[name] = func(...any) any { return nil }
+		funcDefs[name] = noopFunc
 	}
 
 	// Pre-declare local $variables so Go's template parser accepts them
@@ -140,10 +207,53 @@ func parseExpressionTree(expr string, funcMaps FuncMapRegistry, localVarNames []
 	if tmpl.Tree == nil {
 		return nil, fmt.Errorf("missing parse tree")
 	}
+
+	names := make([]string, 0, len(funcMaps))
+	for name := range funcMaps {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	exprTreeCacheMu.Lock()
+	if len(exprTreeCache) >= maxExprTreeCacheEntries {
+		// Bound memory in long-lived daemons by dropping all entries instead
+		// of tracking per-key recency; repopulation costs one parse per key.
+		clear(exprTreeCache)
+	}
+	exprTreeCache[key] = cachedExprTree{tree: tmpl.Tree, regNames: names}
+	exprTreeCacheMu.Unlock()
+
 	return tmpl.Tree, nil
 }
 
-func (i expressionInferencer) inferPipe(pipe *templateparse.PipeNode) *ExpressionTypeResult {
+// noopFunc is a shared stateless stub substituted for every function during
+// expression parsing; only the parse tree shape matters, never call results.
+func noopFunc(...any) any { return nil }
+
+// matches reports whether the cached tree was parsed against exactly the
+// function name set of the given registry.
+func (c cachedExprTree) matches(funcMaps FuncMapRegistry) bool {
+	if len(c.regNames) != len(funcMaps) {
+		return false
+	}
+	for name := range funcMaps {
+		if _, ok := slices.BinarySearch(c.regNames, name); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// exprTreeCacheKey combines the expression text and the pre-declared local
+// variable names, both of which determine the shape of the parsed tree.
+func exprTreeCacheKey(expr string, localVarNames []string) string {
+	if len(localVarNames) == 0 {
+		return expr
+	}
+	return expr + "\x00" + strings.Join(localVarNames, "\x01")
+}
+
+func (i *expressionInferencer) inferPipe(pipe *templateparse.PipeNode) *ExpressionTypeResult {
 	if pipe == nil {
 		return nil
 	}
@@ -158,7 +268,7 @@ func (i expressionInferencer) inferPipe(pipe *templateparse.PipeNode) *Expressio
 	return piped
 }
 
-func (i expressionInferencer) inferCommand(cmd *templateparse.CommandNode, piped *ExpressionTypeResult) *ExpressionTypeResult {
+func (i *expressionInferencer) inferCommand(cmd *templateparse.CommandNode, piped *ExpressionTypeResult) *ExpressionTypeResult {
 	if cmd == nil || len(cmd.Args) == 0 {
 		return nil
 	}
@@ -184,6 +294,10 @@ func (i expressionInferencer) inferCommand(cmd *templateparse.CommandNode, piped
 // ValidateFunctionCallArgTypes infers the type of every argument passed to a
 // registered template function inside expr and returns the mismatches against
 // the function's declared parameter types. Positions are relative to expr.
+//
+// All maps and slices passed in are treated as strictly read-only and are
+// never mutated nor retained beyond the call, so callers may share them
+// freely, including concurrently across goroutines.
 func ValidateFunctionCallArgTypes(
 	expr string,
 	vars map[string]ast.TemplateVar,
@@ -198,11 +312,11 @@ func ValidateFunctionCallArgTypes(
 	}
 
 	inferencer := expressionInferencer{
-		vars:         cloneTemplateVarMap(vars),
-		scopeStack:   cloneScopeStack(scopeStack),
-		blockLocals:  cloneTemplateVarMap(blockLocals),
-		funcMaps:     maps.Clone(funcMaps),
-		typeRegistry: maps.Clone(typeRegistry),
+		vars:         vars,
+		scopeStack:   scopeStack,
+		blockLocals:  blockLocals,
+		funcMaps:     funcMaps,
+		typeRegistry: typeRegistry,
 	}
 
 	localVarNames := inferencer.collectLocalVarNames()
@@ -245,7 +359,7 @@ func prefixForLocalVars(localVarNames []string) string {
 
 // validatePipeArgTypes walks every command of a pipe, recursively validating
 // nested pipes, and reports argument type mismatches for registered functions.
-func (i expressionInferencer) validatePipeArgTypes(pipe *templateparse.PipeNode) []ArgTypeMismatch {
+func (i *expressionInferencer) validatePipeArgTypes(pipe *templateparse.PipeNode) []ArgTypeMismatch {
 	if pipe == nil {
 		return nil
 	}
@@ -284,7 +398,7 @@ func (i expressionInferencer) validatePipeArgTypes(pipe *templateparse.PipeNode)
 
 // checkCommandArgTypes compares each inferred argument type against the declared
 // parameter types of the named function.
-func (i expressionInferencer) checkCommandArgTypes(funcName string, rawArgs []templateparse.Node, args []*ExpressionTypeResult, fallbackPos templateparse.Pos) []ArgTypeMismatch {
+func (i *expressionInferencer) checkCommandArgTypes(funcName string, rawArgs []templateparse.Node, args []*ExpressionTypeResult, fallbackPos templateparse.Pos) []ArgTypeMismatch {
 	fn, ok := i.funcMaps[funcName]
 	if !ok || len(fn.Params) == 0 {
 		return nil
@@ -684,7 +798,7 @@ func stripAssignmentPrefix(expr string) string {
 	return trimmed
 }
 
-func (i expressionInferencer) inferNode(node templateparse.Node) *ExpressionTypeResult {
+func (i *expressionInferencer) inferNode(node templateparse.Node) *ExpressionTypeResult {
 	switch typed := node.(type) {
 	case *templateparse.PipeNode:
 		return i.inferPipe(typed)
@@ -715,7 +829,7 @@ func (i expressionInferencer) inferNode(node templateparse.Node) *ExpressionType
 	}
 }
 
-func (i expressionInferencer) resolveIdentifier(name string) *ExpressionTypeResult {
+func (i *expressionInferencer) resolveIdentifier(name string) *ExpressionTypeResult {
 	if name == "" {
 		return nil
 	}
@@ -741,7 +855,7 @@ func (i expressionInferencer) resolveIdentifier(name string) *ExpressionTypeResu
 	return nil
 }
 
-func (i expressionInferencer) currentDotType() *ExpressionTypeResult {
+func (i *expressionInferencer) currentDotType() *ExpressionTypeResult {
 	if len(i.scopeStack) > 0 {
 		current := i.scopeStack[len(i.scopeStack)-1]
 		return &ExpressionTypeResult{
@@ -753,18 +867,18 @@ func (i expressionInferencer) currentDotType() *ExpressionTypeResult {
 			KeyType:  current.KeyType,
 		}
 	}
-	root := buildRootScope(i.vars)
-	return &ExpressionTypeResult{TypeStr: "context", Fields: root.Fields}
+	root := i.rootScopeFields()
+	return &ExpressionTypeResult{TypeStr: "context", Fields: root}
 }
 
-func (i expressionInferencer) resolveVariablePath(parts []string) *ExpressionTypeResult {
+func (i *expressionInferencer) resolveVariablePath(parts []string) *ExpressionTypeResult {
 	if len(parts) == 0 {
 		return nil
 	}
 
 	if parts[0] == "$" {
 		if len(parts) == 1 {
-			return &ExpressionTypeResult{TypeStr: "context", Fields: buildRootScope(i.vars).Fields}
+			return &ExpressionTypeResult{TypeStr: "context", Fields: i.rootScopeFields()}
 		}
 		name := parts[1]
 		if v, ok := i.blockLocals[name]; ok {
@@ -798,7 +912,7 @@ func (i expressionInferencer) resolveVariablePath(parts []string) *ExpressionTyp
 	return nil
 }
 
-func (i expressionInferencer) resolveFieldPath(parts []string) *ExpressionTypeResult {
+func (i *expressionInferencer) resolveFieldPath(parts []string) *ExpressionTypeResult {
 	if len(parts) == 0 {
 		return nil
 	}
@@ -815,7 +929,7 @@ func (i expressionInferencer) resolveFieldPath(parts []string) *ExpressionTypeRe
 	return i.resolveIdentifier(parts[0])
 }
 
-func (i expressionInferencer) resolveChainedField(base *ExpressionTypeResult, parts []string) *ExpressionTypeResult {
+func (i *expressionInferencer) resolveChainedField(base *ExpressionTypeResult, parts []string) *ExpressionTypeResult {
 	if base == nil {
 		return nil
 	}
@@ -840,7 +954,7 @@ func (i expressionInferencer) resolveChainedField(base *ExpressionTypeResult, pa
 	return i.hydrateResult(current)
 }
 
-func (i expressionInferencer) normalizeFieldResult(field ast.FieldInfo) *ExpressionTypeResult {
+func (i *expressionInferencer) normalizeFieldResult(field ast.FieldInfo) *ExpressionTypeResult {
 	if field.TypeStr == "method" && len(field.Returns) > 0 {
 		ret := field.Returns[0]
 		doc := field.Doc
@@ -882,7 +996,7 @@ func (i expressionInferencer) normalizeFieldResult(field ast.FieldInfo) *Express
 	})
 }
 
-func (i expressionInferencer) inferFunctionCall(name string, rawArgs []templateparse.Node, args []*ExpressionTypeResult) *ExpressionTypeResult {
+func (i *expressionInferencer) inferFunctionCall(name string, rawArgs []templateparse.Node, args []*ExpressionTypeResult) *ExpressionTypeResult {
 	if funcMap, ok := i.funcMaps[name]; ok && name != "dict" {
 		return i.hydrateResult(functionResultToExpressionResult(funcMap))
 	}
@@ -925,7 +1039,7 @@ func (i expressionInferencer) inferFunctionCall(name string, rawArgs []templatep
 	}
 }
 
-func (i expressionInferencer) inferCallableTarget(target *ExpressionTypeResult) *ExpressionTypeResult {
+func (i *expressionInferencer) inferCallableTarget(target *ExpressionTypeResult) *ExpressionTypeResult {
 	if target == nil {
 		return &ExpressionTypeResult{TypeStr: "unknown"}
 	}
@@ -948,7 +1062,7 @@ func (i expressionInferencer) inferCallableTarget(target *ExpressionTypeResult) 
 	return i.hydrateResult(target)
 }
 
-func (i expressionInferencer) inferDictResult(rawArgs []templateparse.Node, args []*ExpressionTypeResult) *ExpressionTypeResult {
+func (i *expressionInferencer) inferDictResult(rawArgs []templateparse.Node, args []*ExpressionTypeResult) *ExpressionTypeResult {
 	fields := make([]ast.FieldInfo, 0, len(args)/2)
 	for idx := 0; idx+1 < len(args); idx += 2 {
 		keyNode := args[idx]
@@ -994,7 +1108,7 @@ func (i expressionInferencer) inferDictResult(rawArgs []templateparse.Node, args
 	return &ExpressionTypeResult{TypeStr: "map[string]any", IsMap: true, Fields: fields}
 }
 
-func (i expressionInferencer) collectionElementResult(current *ExpressionTypeResult) *ExpressionTypeResult {
+func (i *expressionInferencer) collectionElementResult(current *ExpressionTypeResult) *ExpressionTypeResult {
 	if current == nil {
 		return nil
 	}
@@ -1017,7 +1131,7 @@ func (i expressionInferencer) collectionElementResult(current *ExpressionTypeRes
 	})
 }
 
-func (i expressionInferencer) hydrateResult(result *ExpressionTypeResult) *ExpressionTypeResult {
+func (i *expressionInferencer) hydrateResult(result *ExpressionTypeResult) *ExpressionTypeResult {
 	if result == nil {
 		return nil
 	}
@@ -1033,7 +1147,7 @@ func (i expressionInferencer) hydrateResult(result *ExpressionTypeResult) *Expre
 	return result
 }
 
-func (i expressionInferencer) fieldsForType(typeStr string, fallback []ast.FieldInfo) []ast.FieldInfo {
+func (i *expressionInferencer) fieldsForType(typeStr string, fallback []ast.FieldInfo) []ast.FieldInfo {
 	if len(fallback) > 0 {
 		return fallback
 	}
@@ -1198,27 +1312,6 @@ func isNumericTypeName(typeStr string) bool {
 	default:
 		return false
 	}
-}
-
-func cloneTemplateVarMap(input map[string]ast.TemplateVar) map[string]ast.TemplateVar {
-	if input == nil {
-		return nil
-	}
-	return maps.Clone(input)
-}
-
-func cloneScopeStack(input []ScopeType) []ScopeType {
-	if len(input) == 0 {
-		return nil
-	}
-	result := make([]ScopeType, len(input))
-	copy(result, input)
-	for idx := range result {
-		if result[idx].Locals != nil {
-			result[idx].Locals = maps.Clone(result[idx].Locals)
-		}
-	}
-	return result
 }
 
 func boolToInt(value bool) int {

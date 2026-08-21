@@ -319,12 +319,12 @@ func createScopeFromLocalExpression(expr string, scopeStack []ScopeType) ScopeTy
 }
 
 func createScopeFromIndexExpression(expr string, scopeStack []ScopeType, varMap map[string]ast.TemplateVar, funcMaps FuncMapRegistry) ScopeType {
-	parts := strings.Fields(expr)
-	if len(parts) < 2 {
+	_, second := firstTwoWords(expr)
+	if second == "" {
 		return ScopeType{Fields: []ast.FieldInfo{}}
 	}
 
-	baseScope := resolveScopeFromExpression(parts[1], scopeStack, varMap, funcMaps)
+	baseScope := resolveScopeFromExpression(second, scopeStack, varMap, funcMaps)
 	return elementScopeFromCollection(baseScope)
 }
 
@@ -333,17 +333,17 @@ func createScopeFromFunctionExpression(expr string, funcMaps FuncMapRegistry) (S
 		return ScopeType{}, false
 	}
 
-	tokens := strings.Fields(unwrapExpression(expr))
-	if len(tokens) == 0 {
+	first, second := firstTwoWords(unwrapExpression(expr))
+	if first == "" {
 		return ScopeType{}, false
 	}
 
-	funcName := strings.Trim(tokens[0], "()")
+	funcName := strings.Trim(first, "()")
 	if funcName == "call" {
-		if len(tokens) < 2 {
+		if second == "" {
 			return ScopeType{}, false
 		}
-		funcName = strings.Trim(tokens[1], "()")
+		funcName = strings.Trim(second, "()")
 	}
 
 	if !isFunctionIdentifier(funcName) {

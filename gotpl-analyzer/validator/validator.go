@@ -31,10 +31,22 @@ func ValidateTemplates(
 	baseDir string,
 	templateRoot string,
 ) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
-	funcMapRegistry := BuildFuncMapRegistry(funcMaps)
-
-	// Single disk walk: load all template contents into memory once
 	store := LoadTemplateStore(baseDir, templateRoot)
+	return ValidateTemplatesWithStore(renderCalls, funcMaps, baseDir, templateRoot, store)
+}
+
+// ValidateTemplatesWithStore validates templates against render calls using a
+// caller-provided template store, so callers that already loaded the store
+// (e.g. the daemon, which reuses it for render-var propagation) avoid a second
+// full disk walk and a second transient copy of every template's content.
+func ValidateTemplatesWithStore(
+	renderCalls []ast.RenderCall,
+	funcMaps []ast.FuncMapInfo,
+	baseDir string,
+	templateRoot string,
+	store TemplateStore,
+) ([]ValidationResult, map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
+	funcMapRegistry := BuildFuncMapRegistry(funcMaps)
 
 	// Parse named blocks using the in-memory template store
 	namedBlocks, namedBlockErrors := parseAllNamedTemplatesFromStore(store, baseDir, templateRoot)
@@ -107,7 +119,7 @@ func LoadTemplateStore(baseDir, templateRoot string) TemplateStore {
 
 func parseAllNamedTemplatesFromStore(store TemplateStore, baseDir, templateRoot string) (map[string][]NamedBlockEntry, []NamedBlockDuplicateError) {
 	root := filepath.Join(baseDir, templateRoot)
-	registry := make(map[string][]NamedBlockEntry)
+	registry := make(map[string][]NamedBlockEntry, len(store))
 
 	for path, content := range store {
 		rel, err := filepath.Rel(root, path)
@@ -406,8 +418,16 @@ func validateOrphanedNamedBlocks(
 	})
 }
 
+// minParallelWorkItems is the minimum input size below which runWorkers
+// collapses to a single worker; smaller inputs gain nothing from a full
+// goroutine pool and only pay channel and scheduling overhead.
+const minParallelWorkItems = 32
+
 func runWorkers(total int, fn func([]int) []ValidationResult) []ValidationResult {
 	numWorkers := max(runtime.NumCPU(), 1)
+	if total < minParallelWorkItems {
+		numWorkers = 1
+	}
 	chunkSize := (total + numWorkers - 1) / numWorkers
 
 	resultChan := make(chan []ValidationResult, numWorkers)

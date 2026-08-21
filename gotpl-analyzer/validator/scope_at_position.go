@@ -183,13 +183,9 @@ func buildScopeAtPosition(content string, varMap map[string]ast.TemplateVar, tem
 			continue
 		}
 
-		words := strings.Fields(action)
-		first := ""
-		if len(words) > 0 {
-			first = words[0]
-			if idx := strings.IndexByte(first, '('); idx != -1 {
-				first = first[:idx]
-			}
+		first, second := firstTwoWords(action)
+		if idx := strings.IndexByte(first, '('); idx != -1 {
+			first = first[:idx]
 		}
 
 		// ── Check if this action is at or past the target position ──────
@@ -266,8 +262,8 @@ func buildScopeAtPosition(content string, varMap map[string]ast.TemplateVar, tem
 				continue
 			}
 			scopeStack = scopeStack[:len(scopeStack)-1]
-			if len(words) > 1 {
-				elseAction = words[1]
+			if second != "" {
+				elseAction = second
 				if idx := strings.IndexByte(elseAction, '('); idx != -1 {
 					elseAction = elseAction[:idx]
 				}
@@ -314,8 +310,8 @@ func buildScopeAtPosition(content string, varMap map[string]ast.TemplateVar, tem
 			// their context from the template/block call site. For position-scope
 			// purposes, look up the registry to see if there is a matching render
 			// call that provides vars, otherwise use an empty scope.
-			if len(words) >= 2 {
-				defName := strings.Trim(words[1], `"`)
+			if second != "" {
+				defName := strings.Trim(second, `"`)
 				var _ string = defName
 				varMapForDefine := findDefineVars(effectiveRegistry, varMap, scopeStack, effectiveFuncMaps)
 				newScope := buildRootScope(varMapForDefine)
@@ -334,7 +330,7 @@ func buildScopeAtPosition(content string, varMap map[string]ast.TemplateVar, tem
 		if isElse {
 			if elseAction != "" {
 				actionToPush = elseAction
-				idx := strings.Index(action, words[1])
+				idx := strings.Index(action, second)
 				if idx != -1 {
 					exprToParse = action[idx:]
 				}
@@ -433,9 +429,9 @@ func extractHoverExpression(action, first string) string {
 		if rest == "" {
 			return ""
 		}
-		words := strings.Fields(rest)
-		if len(words) > 0 {
-			switch words[0] {
+		head, _ := firstTwoWords(rest)
+		if head != "" {
+			switch head {
 			case "if":
 				expr := strings.TrimSpace(strings.TrimPrefix(rest, "if"))
 				_, pipeline, hasAssignment := splitAssignment(expr)

@@ -167,6 +167,12 @@ func collectStringMapLiteral(name string, comp *goast.CompositeLit, info *types.
 	}
 }
 
+// minParallelWorkUnits is the minimum input size below which concurrent
+// helpers collapse to a single worker. Fanning out a full goroutine pool for
+// fewer units pays more in channel, WaitGroup, and goroutine overhead than
+// the parallelism recovers.
+const minParallelWorkUnits = 32
+
 // processNodesConcurrently distributes work units across multiple workers
 // and aggregates their results.
 func processNodesConcurrently(
@@ -182,6 +188,9 @@ func processNodesConcurrently(
 	stringMapIndex map[string][]string,
 ) []FuncScope {
 	numWorkers := max(runtime.NumCPU(), 1)
+	if len(funcNodes) < minParallelWorkUnits {
+		numWorkers = 1
+	}
 	chunkSize := (len(funcNodes) + numWorkers - 1) / numWorkers
 	resultChan := make(chan []FuncScope, numWorkers)
 	var wg sync.WaitGroup

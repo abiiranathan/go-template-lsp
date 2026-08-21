@@ -3,6 +3,8 @@ package validator
 import (
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/abiiranathan/go-template-lsp/gotpl-analyzer/ast"
 )
@@ -27,6 +29,39 @@ func IsFileBasedPartial(name string) bool {
 // isWhitespace checks if a byte is whitespace (space, tab, newline, carriage return).
 func isWhitespace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+// nextWord splits the leading whitespace-delimited word off s and returns it
+// together with the remainder. It uses the same space definition as
+// strings.Fields (unicode.IsSpace) so callers observe identical word
+// boundaries without allocating a slice of all fields.
+func nextWord(s string) (word, rest string) {
+	i := 0
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		i += size
+	}
+	start := i
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if unicode.IsSpace(r) {
+			break
+		}
+		i += size
+	}
+	return s[start:i], s[i:]
+}
+
+// firstTwoWords returns the first two whitespace-separated words of s. Either
+// may be empty when s has fewer words. This avoids the []string allocation of
+// strings.Fields on hot per-action scanning paths that only inspect the head.
+func firstTwoWords(s string) (first, second string) {
+	first, s = nextWord(s)
+	second, _ = nextWord(s)
+	return first, second
 }
 
 // ValidateTemplateFileStr exposes internal validation for testing.
@@ -126,13 +161,9 @@ func collectCallContextsWithScope(
 			continue
 		}
 
-		words := strings.Fields(action)
-		first := ""
-		if len(words) > 0 {
-			first = words[0]
-			if idx := strings.IndexByte(first, '('); idx != -1 {
-				first = first[:idx]
-			}
+		first, second := firstTwoWords(action)
+		if idx := strings.IndexByte(first, '('); idx != -1 {
+			first = first[:idx]
 		}
 
 		isElse := first == "else"
@@ -142,8 +173,8 @@ func collectCallContextsWithScope(
 			if len(scopeStack) > 1 {
 				scopeStack = scopeStack[:len(scopeStack)-1]
 			}
-			if len(words) > 1 {
-				elseAction = words[1]
+			if second != "" {
+				elseAction = second
 				if idx := strings.IndexByte(elseAction, '('); idx != -1 {
 					elseAction = elseAction[:idx]
 				}
@@ -185,7 +216,7 @@ func collectCallContextsWithScope(
 		if isElse {
 			if elseAction != "" {
 				actionToPush = elseAction
-				idx := strings.Index(action, words[1])
+				idx := strings.Index(action, second)
 				if idx != -1 {
 					exprToParse = action[idx:]
 				}

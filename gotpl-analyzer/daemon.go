@@ -527,29 +527,33 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 	params daemonAnalyzeParams,
 	baseDir, goFP, tmplFP string,
 ) (ValidationOutput, error) {
-	// 1. Build the global deduplicated Type registry first
-	rawResult.BuildTypeRegistry()
-
-	// 2. Run template validation
-	validationErrors, namedBlocks, namedBlockErrors := validator.ValidateTemplates(
+	// 1. Run template validation. The type registry is NOT built here —
+	// Flatten() below populates it just before stripping the inline field
+	// trees it is derived from, so an explicit earlier build would be a
+	// redundant full tree walk per analyze cycle.
+	// The template store is loaded once here and shared with validation;
+	// loading it inside ValidateTemplates as well would double the disk walk
+	// and transiently retain two copies of every template's content.
+	store := validator.LoadTemplateStore(baseDir, params.TemplateRoot)
+	validationErrors, namedBlocks, namedBlockErrors := validator.ValidateTemplatesWithStore(
 		rawResult.RenderCalls,
 		rawResult.FuncMaps,
 		baseDir,
 		params.TemplateRoot,
+		store,
 	)
 
-	store := validator.LoadTemplateStore(baseDir, params.TemplateRoot)
 	funcMapReg := validator.BuildFuncMapRegistry(rawResult.FuncMaps)
 
-	// 3. Build render-var index with partial & named-block propagation
+	// 2. Build render-var index with partial & named-block propagation
 	renderVarIndex := validator.BuildPropagatedRenderVarIndex(
 		rawResult.RenderCalls, namedBlocks, baseDir, params.TemplateRoot, funcMapReg, store,
 	)
 
-	// 4. Flatten rawResult in-place (strips inline field trees, keeping only Types registry)
+	// 3. Flatten rawResult in-place (strips inline field trees, keeping only Types registry)
 	rawResult.Flatten()
 
-	// 5. Prepare Output RenderCalls without deep-copying field trees
+	// 4. Prepare Output RenderCalls without deep-copying field trees
 	outputRenderCalls := make([]ast.RenderCall, len(rawResult.RenderCalls))
 	copy(outputRenderCalls, rawResult.RenderCalls)
 
@@ -559,16 +563,24 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 		existingCalls[rc.Template] = true
 		if propagated, ok := renderVarIndex[rc.Template]; ok && len(propagated) > 0 {
 			rc.Vars = shallowMergeVars(rc.Vars, propagated)
+			// Propagated variables are resolved through scope walking and may
+			// carry inline field trees; strip them so the response matches the
+			// ValidationOutput contract (consumers resolve types via Types).
+			// Only the copied structs are mutated — the snapshot's
+			// renderVarsByTemplate keeps its trees for hover/validation.
+			stripInlineTrees(rc.Vars)
 		}
 	}
 
 	for tplName, vars := range renderVarIndex {
 		if !existingCalls[tplName] && len(vars) > 0 {
+			syntheticVars := shallowCopyVars(vars)
+			stripInlineTrees(syntheticVars)
 			outputRenderCalls = append(outputRenderCalls, ast.RenderCall{
 				File:     "template-call",
 				Line:     1,
 				Template: tplName,
-				Vars:     shallowCopyVars(vars),
+				Vars:     syntheticVars,
 			})
 		}
 	}
@@ -624,6 +636,15 @@ func shallowCopyVars(vars []ast.TemplateVar) []ast.TemplateVar {
 	out := make([]ast.TemplateVar, len(vars))
 	copy(out, vars)
 	return out
+}
+
+// stripInlineTrees clears the top-level field tree of each variable. Because
+// nested FieldInfo trees are only reachable through this slice, a single nil
+// assignment drops the whole tree without walking it.
+func stripInlineTrees(vars []ast.TemplateVar) {
+	for i := range vars {
+		vars[i].Fields = nil
+	}
 }
 
 // shallowMergeVars merges two variable slices by name with zero recursion overhead.

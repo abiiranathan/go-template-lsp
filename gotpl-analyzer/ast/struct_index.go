@@ -15,6 +15,9 @@ import (
 // this was a significant serial bottleneck.
 func buildStructIndex(fset *token.FileSet, files map[string]*goast.File) map[string]structIndexEntry {
 	numWorkers := max(runtime.NumCPU(), 1)
+	if len(files) < minParallelWorkUnits {
+		numWorkers = 1
+	}
 	fileChan := make(chan *goast.File, len(files))
 
 	var sharedIndex sync.Map
@@ -147,6 +150,9 @@ func attachMethodDocsConcurrent(files map[string]*goast.File, fset *token.FileSe
 	}
 
 	numWorkers := max(runtime.NumCPU(), 1)
+	if len(works) < minParallelWorkUnits {
+		numWorkers = 1
+	}
 	chunkSize := (len(works) + numWorkers - 1) / numWorkers
 
 	var mu sync.Mutex // protects writes to index

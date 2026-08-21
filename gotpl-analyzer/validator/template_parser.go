@@ -43,10 +43,13 @@ func processTemplateFilesConcurrently(templateFiles []string, root string) map[s
 
 	var (
 		mu       sync.Mutex
-		registry = make(map[string][]NamedBlockEntry)
+		registry = make(map[string][]NamedBlockEntry, len(templateFiles))
 	)
 
 	numWorkers := max(runtime.NumCPU(), 1)
+	if len(templateFiles) < minParallelWorkItems {
+		numWorkers = 1
+	}
 	fileChan := make(chan string, len(templateFiles))
 
 	for _, p := range templateFiles {

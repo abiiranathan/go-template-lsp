@@ -146,13 +146,9 @@ func validateTemplateContentWithRegistry(
 			continue
 		}
 
-		words := strings.Fields(action)
-		first := ""
-		if len(words) > 0 {
-			first = words[0]
-			if idx := strings.IndexByte(first, '('); idx != -1 {
-				first = first[:idx]
-			}
+		first, second := firstTwoWords(action)
+		if idx := strings.IndexByte(first, '('); idx != -1 {
+			first = first[:idx]
 		}
 
 		if defineSkipDepth > 0 {
@@ -182,8 +178,8 @@ func validateTemplateContentWithRegistry(
 			}
 			scopeStack = scopeStack[:len(scopeStack)-1]
 			openingActions = openingActions[:len(openingActions)-1]
-			if len(words) > 1 {
-				elseAction = words[1]
+			if second != "" {
+				elseAction = second
 				if idx := strings.IndexByte(elseAction, '('); idx != -1 {
 					elseAction = elseAction[:idx]
 				}
@@ -286,7 +282,7 @@ func validateTemplateContentWithRegistry(
 		if isElse {
 			if elseAction != "" {
 				actionToPush = elseAction
-				idx := strings.Index(action, words[1])
+				idx := strings.Index(action, second)
 				if idx != -1 {
 					exprToParse = action[idx:]
 				}

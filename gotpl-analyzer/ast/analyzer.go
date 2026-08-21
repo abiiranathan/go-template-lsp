@@ -27,6 +27,8 @@ func InvalidateCache() {
 
 // AnalyzeDir performs static analysis with in-memory caching.
 func AnalyzeDir(dir string, contextFile string, config *AnalysisConfig) AnalysisResult {
+	ClearTypeCache()
+
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
 

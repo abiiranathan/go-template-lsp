@@ -98,7 +98,7 @@ func extractFieldsUncachedDepth(
 		if entry, exists := structIndex[astKey]; exists {
 			doc = entry.doc
 		}
-		return extractMethodFields(named, structIndex, fc, seen, fset, depth), doc
+		return extractMethodFields(named, fset), doc
 	}
 
 	entry := structIndex[astKey]
@@ -112,7 +112,7 @@ func extractFieldsUncachedDepth(
 	}
 
 	fields := extractStructFieldsDepth(strct, entry, structIndex, fc, seen, fset, depth)
-	fields = append(fields, extractMethodFields(named, structIndex, fc, seen, fset, depth)...)
+	fields = append(fields, extractMethodFields(named, fset)...)
 	addMethodDocs(fields, entry)
 
 	return fields, doc
@@ -209,14 +209,17 @@ func buildFieldInfoDepth(
 // extractMethodFields extracts exported methods as FieldInfo entries.
 func extractMethodFields(
 	named *types.Named,
-	structIndex map[string]structIndexEntry,
-	fc *fieldCache,
-	seen map[string]bool,
 	fset *token.FileSet,
-	depth int,
 ) []FieldInfo {
-	var methodSet *types.MethodSet
+	// If the type belongs to standard library (e.g. time.Time), skip heavy method tree recursion
+	if named.Obj() != nil && named.Obj().Pkg() != nil {
+		pkgPath := named.Obj().Pkg().Path()
+		if !strings.Contains(pkgPath, ".") { // stdlib packages don't have '.' in their path
+			return nil
+		}
+	}
 
+	var methodSet *types.MethodSet
 	if _, isInterface := named.Underlying().(*types.Interface); isInterface {
 		methodSet = types.NewMethodSet(named)
 	} else {
@@ -224,7 +227,6 @@ func extractMethodFields(
 	}
 
 	fields := make([]FieldInfo, 0, methodSet.Len())
-
 	for sel := range methodSet.Methods() {
 		if !sel.Obj().Exported() {
 			continue
@@ -241,24 +243,7 @@ func extractMethodFields(
 		}
 
 		if sig, ok := method.Type().(*types.Signature); ok {
-			fi.Params, fi.Returns, _ = extractSignatureInfoWithFields(sig, structIndex, fc, seen, fset, depth+1)
-
-			if recv := sig.Recv(); recv != nil {
-				recvType := unwrapType(recv.Type())
-				if rt, ok := recvType.(*types.Named); ok {
-					astKey := getASTKey(rt)
-					if entry, exists := structIndex[astKey]; exists {
-						if pos, ok := entry.fields[method.Name()]; ok {
-							fi.Doc = pos.doc
-							if fi.DefFile == "" {
-								fi.DefFile = pos.file
-								fi.DefLine = pos.line
-								fi.DefCol = pos.col
-							}
-						}
-					}
-				}
-			}
+			fi.Params, fi.Returns, _ = extractSignatureInfoWithFields(sig)
 		}
 
 		if pos := method.Pos(); pos.IsValid() && fset != nil {
@@ -266,9 +251,6 @@ func extractMethodFields(
 			fi.DefFile = position.Filename
 			fi.DefLine = position.Line
 			fi.DefCol = position.Column
-			if fi.Doc == "" {
-				fi.Doc = funcDocAt(position.Filename, position.Line)
-			}
 		}
 
 		fields = append(fields, fi)
@@ -277,24 +259,16 @@ func extractMethodFields(
 	return fields
 }
 
-// extractSignatureInfoWithFields extracts signature info and recursively extracts
-// the struct fields for any returned types.
-func extractSignatureInfoWithFields(
-	sig *types.Signature,
-	structIndex map[string]structIndexEntry,
-	fc *fieldCache,
-	seen map[string]bool,
-	fset *token.FileSet,
-	depth int,
-) (params, returns []ParamInfo, args []string) {
+// extractSignatureInfoWithFields extracts signature info without recursively
+// expanding return type struct fields to avoid exponential explosion.
+func extractSignatureInfoWithFields(sig *types.Signature) (params, returns []ParamInfo, args []string) {
 	params, returns, args = extractSignatureInfo(sig)
 
+	// DO NOT recursively call extractFieldsWithDocsDepth on return types.
+	// Return types are resolved through the global Types registry on demand.
 	for i := 0; i < sig.Results().Len(); i++ {
 		rt := sig.Results().At(i).Type()
-		elemSeen := copySeenMap(seen)
-		fields, doc := extractFieldsWithDocsDepth(rt, structIndex, fc, elemSeen, fset, depth)
-		returns[i].Fields = fields
-		returns[i].Doc = doc
+		returns[i].TypeStr = normalizeTypeStr(rt)
 	}
 
 	return

@@ -520,38 +520,45 @@ func (d *analyzerDaemon) analyze(params daemonAnalyzeParams) (ValidationOutput, 
 // buildSnapshotFromResult runs template validation and builds an immutable
 // daemon state snapshot from an existing AnalysisResult. This is shared by
 // both the full analyze path and the incremental (templates-only) path.
+// buildSnapshotFromResult runs template validation and builds an immutable
+// daemon state snapshot from an existing AnalysisResult.
 func (d *analyzerDaemon) buildSnapshotFromResult(
 	rawResult *ast.AnalysisResult,
 	params daemonAnalyzeParams,
 	baseDir, goFP, tmplFP string,
 ) (ValidationOutput, error) {
-	// Always keep a pristine clone for subsequent incremental runs
-	pristineResult := cloneAnalysisResultDeep(rawResult)
+	// 1. Build the global deduplicated Type registry first
+	rawResult.BuildTypeRegistry()
 
+	// 2. Run template validation
 	validationErrors, namedBlocks, namedBlockErrors := validator.ValidateTemplates(
-		pristineResult.RenderCalls,
-		pristineResult.FuncMaps,
+		rawResult.RenderCalls,
+		rawResult.FuncMaps,
 		baseDir,
 		params.TemplateRoot,
 	)
 
 	store := validator.LoadTemplateStore(baseDir, params.TemplateRoot)
-	funcMapReg := validator.BuildFuncMapRegistry(pristineResult.FuncMaps)
+	funcMapReg := validator.BuildFuncMapRegistry(rawResult.FuncMaps)
 
-	// Build render-var index with full partial & named-block variable propagation
+	// 3. Build render-var index with partial & named-block propagation
 	renderVarIndex := validator.BuildPropagatedRenderVarIndex(
-		pristineResult.RenderCalls, namedBlocks, baseDir, params.TemplateRoot, funcMapReg, store,
+		rawResult.RenderCalls, namedBlocks, baseDir, params.TemplateRoot, funcMapReg, store,
 	)
 
-	// Prepare an isolated copy of RenderCalls for JSON payload output & Flatten()
-	outputRenderCalls := cloneRenderCallsDeep(pristineResult.RenderCalls)
+	// 4. Flatten rawResult in-place (strips inline field trees, keeping only Types registry)
+	rawResult.Flatten()
+
+	// 5. Prepare Output RenderCalls without deep-copying field trees
+	outputRenderCalls := make([]ast.RenderCall, len(rawResult.RenderCalls))
+	copy(outputRenderCalls, rawResult.RenderCalls)
 
 	existingCalls := make(map[string]bool, len(outputRenderCalls))
 	for i := range outputRenderCalls {
 		rc := &outputRenderCalls[i]
 		existingCalls[rc.Template] = true
 		if propagated, ok := renderVarIndex[rc.Template]; ok && len(propagated) > 0 {
-			rc.Vars = mergeVarSlicesDeep(rc.Vars, propagated)
+			rc.Vars = shallowMergeVars(rc.Vars, propagated)
 		}
 	}
 
@@ -561,31 +568,30 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 				File:     "template-call",
 				Line:     1,
 				Template: tplName,
-				Vars:     cloneTemplateVarsDeep(vars),
+				Vars:     shallowCopyVars(vars),
 			})
 		}
 	}
 
-	// Working copy for Flatten() to generate Types registry and compact RenderCalls
-	flattenTarget := &ast.AnalysisResult{
-		RenderCalls: outputRenderCalls,
-		FuncMaps:    cloneFuncMapsDeep(pristineResult.FuncMaps),
-		Errors:      pristineResult.Errors,
+	// Filter out synthetic whole-file entries from output namedBlocks to keep JSON small
+	cleanNamedBlocks := make(map[string][]validator.NamedBlockEntry, len(namedBlocks))
+	for name, entries := range namedBlocks {
+		if validator.IsFileBasedPartial(name) {
+			continue
+		}
+		cleanNamedBlocks[name] = entries
 	}
 
-	flattenTarget.Flatten()
-
 	output := ValidationOutput{
-		RenderCalls:      flattenTarget.RenderCalls,
-		FuncMaps:         flattenTarget.FuncMaps,
-		Errors:           flattenTarget.Errors,
-		NamedBlocks:      namedBlocks,
+		RenderCalls:      outputRenderCalls,
+		FuncMaps:         rawResult.FuncMaps,
+		Errors:           rawResult.Errors,
+		NamedBlocks:      cleanNamedBlocks,
 		NamedBlockErrors: namedBlockErrors,
-		Types:            flattenTarget.Types,
+		Types:            rawResult.Types,
 	}
 	if params.Validate {
 		output.ValidationErrors = validationErrors
-		output.NamedBlocks = namedBlocks
 	}
 
 	snap := &daemonState{
@@ -597,12 +603,12 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 		output:               output,
 		renderVarsByTemplate: renderVarIndex,
 		funcMaps:             funcMapReg,
-		typeRegistry:         flattenTarget.Types,
+		typeRegistry:         rawResult.Types,
 		namedBlocks:          namedBlocks,
 		partialTargets:       validator.FindPartialTargets(baseDir, params.TemplateRoot),
 		goFingerprint:        goFP,
 		templateFingerprint:  tmplFP,
-		analysisResult:       pristineResult,
+		analysisResult:       rawResult,
 	}
 
 	d.state.Store(snap)
@@ -610,104 +616,30 @@ func (d *analyzerDaemon) buildSnapshotFromResult(
 	return output, nil
 }
 
-func cloneAnalysisResultDeep(r *ast.AnalysisResult) *ast.AnalysisResult {
-	if r == nil {
-		return nil
-	}
-	return &ast.AnalysisResult{
-		RenderCalls: cloneRenderCallsDeep(r.RenderCalls),
-		FuncMaps:    cloneFuncMapsDeep(r.FuncMaps),
-		Errors:      append([]string(nil), r.Errors...),
-	}
-}
-
-func cloneRenderCallsDeep(calls []ast.RenderCall) []ast.RenderCall {
-	if len(calls) == 0 {
-		return nil
-	}
-	out := make([]ast.RenderCall, len(calls))
-	for i, rc := range calls {
-		out[i] = rc
-		out[i].Vars = cloneTemplateVarsDeep(rc.Vars)
-	}
-	return out
-}
-
-func cloneTemplateVarsDeep(vars []ast.TemplateVar) []ast.TemplateVar {
+// shallowCopyVars copies variable slices without recursive field tree cloning.
+func shallowCopyVars(vars []ast.TemplateVar) []ast.TemplateVar {
 	if len(vars) == 0 {
 		return nil
 	}
 	out := make([]ast.TemplateVar, len(vars))
-	for i, v := range vars {
-		out[i] = v
-		out[i].Fields = cloneFieldInfosDeep(v.Fields)
-	}
+	copy(out, vars)
 	return out
 }
 
-func cloneFieldInfosDeep(fields []ast.FieldInfo) []ast.FieldInfo {
-	if len(fields) == 0 {
-		return nil
-	}
-	out := make([]ast.FieldInfo, len(fields))
-	for i, f := range fields {
-		out[i] = f
-		out[i].Fields = cloneFieldInfosDeep(f.Fields)
-		if len(f.Params) > 0 {
-			out[i].Params = make([]ast.ParamInfo, len(f.Params))
-			copy(out[i].Params, f.Params)
-		}
-		if len(f.Returns) > 0 {
-			out[i].Returns = make([]ast.ParamInfo, len(f.Returns))
-			for j, r := range f.Returns {
-				out[i].Returns[j] = r
-				out[i].Returns[j].Fields = cloneFieldInfosDeep(r.Fields)
-			}
-		}
-	}
-	return out
-}
-
-func cloneFuncMapsDeep(fms []ast.FuncMapInfo) []ast.FuncMapInfo {
-	if len(fms) == 0 {
-		return nil
-	}
-	out := make([]ast.FuncMapInfo, len(fms))
-	for i, fm := range fms {
-		out[i] = fm
-		if len(fm.Params) > 0 {
-			out[i].Params = make([]ast.ParamInfo, len(fm.Params))
-			copy(out[i].Params, fm.Params)
-		}
-		if len(fm.Returns) > 0 {
-			out[i].Returns = make([]ast.ParamInfo, len(fm.Returns))
-			for j, r := range fm.Returns {
-				out[i].Returns[j] = r
-				out[i].Returns[j].Fields = cloneFieldInfosDeep(r.Fields)
-			}
-		}
-		out[i].ReturnTypeFields = cloneFieldInfosDeep(fm.ReturnTypeFields)
-	}
-	return out
-}
-
-func mergeVarSlicesDeep(a, b []ast.TemplateVar) []ast.TemplateVar {
+// shallowMergeVars merges two variable slices by name with zero recursion overhead.
+func shallowMergeVars(a, b []ast.TemplateVar) []ast.TemplateVar {
 	seen := make(map[string]struct{}, len(a)+len(b))
 	res := make([]ast.TemplateVar, 0, len(a)+len(b))
 	for _, v := range a {
 		if _, exists := seen[v.Name]; !exists {
 			seen[v.Name] = struct{}{}
-			clone := v
-			clone.Fields = cloneFieldInfosDeep(v.Fields)
-			res = append(res, clone)
+			res = append(res, v)
 		}
 	}
 	for _, v := range b {
 		if _, exists := seen[v.Name]; !exists {
 			seen[v.Name] = struct{}{}
-			clone := v
-			clone.Fields = cloneFieldInfosDeep(v.Fields)
-			res = append(res, clone)
+			res = append(res, v)
 		}
 	}
 	return res

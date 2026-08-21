@@ -44,7 +44,7 @@ func processFuncMapIndexAssign(
 
 		if rtv, ok := info.Types[rhs]; ok && rtv.Type != nil {
 			seen := seenPool.get()
-			fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(rtv.Type, structIndex, fc, seen, fset)
+			fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(rtv.Type)
 			seenPool.put(seen)
 			fInfo.ReturnTypeFields = extractFuncReturnFields(rtv.Type, structIndex, fc, seenPool, fset)
 		}
@@ -87,7 +87,7 @@ func extractFuncMaps(
 		if info != nil {
 			if tv, ok := info.Types[kv.Value]; ok && tv.Type != nil {
 				seen := seenPool.get()
-				fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(tv.Type, structIndex, fc, seen, fset)
+				fInfo.Params, fInfo.Returns, fInfo.Args = extractSignatureFromType(tv.Type)
 				seenPool.put(seen)
 				fInfo.ReturnTypeFields = extractFuncReturnFields(tv.Type, structIndex, fc, seenPool, fset)
 			}
@@ -247,10 +247,6 @@ func resolveFuncDoc(expr goast.Expr, info *types.Info, filesMap map[string]*goas
 // Handles both direct signatures and pointer-to-signature.
 func extractSignatureFromType(
 	t types.Type,
-	structIndex map[string]structIndexEntry,
-	fc *fieldCache,
-	seen map[string]bool,
-	fset *token.FileSet,
 ) (params, returns []ParamInfo, args []string) {
 	// Unwrap pointer
 	if ptr, ok := t.(*types.Pointer); ok {
@@ -262,7 +258,7 @@ func extractSignatureFromType(
 		return nil, nil, nil
 	}
 
-	return extractSignatureInfoWithFields(sig, structIndex, fc, seen, fset, 0)
+	return extractSignatureInfoWithFields(sig)
 }
 
 // extractSignatureInfo extracts detailed parameter and return type information

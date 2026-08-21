@@ -23,6 +23,10 @@ func getASTKey(named *types.Named) string {
 
 var typeStrCache sync.Map // types.Type -> string
 
+func ClearTypeCache() {
+	typeStrCache.Clear()
+}
+
 // normalizeTypeStr makes type strings readable by replacing full import paths
 // with their package names, while preserving the package qualifier.
 // Example: "github.com/user/pkg.PatientPayments" → "views.PatientPayments"

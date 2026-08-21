@@ -162,6 +162,5 @@ func isRenderCall(call *goast.CallExpr, config *AnalysisConfig) bool {
 		return true
 	}
 
-	// Backward compatibility fallback
-	return funcName == config.RenderFunctionName || funcName == config.ExecuteTemplateFunctionName
+	return false
 }

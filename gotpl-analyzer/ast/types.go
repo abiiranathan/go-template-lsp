@@ -155,31 +155,15 @@ type AnalysisConfig struct {
 
 	// GlobalTemplateName is the special key used in the context file to define global template variables (default: "global").
 	GlobalTemplateName string `json:"globalTemplateName"`
-
-	// Legacy single-string fields preserved for backwards-compatibility:
-	RenderFunctionName          string `json:"-"`
-	ExecuteTemplateFunctionName string `json:"-"`
-	SetFunctionName             string `json:"-"`
-	ContextTypeName             string `json:"-"`
 }
 
 // DefaultConfig provides framework-agnostic defaults for Go standard library,
 // Gin, Fiber, Echo, Chi, and custom render engines.
 var DefaultConfig = AnalysisConfig{
-	RenderFunctionNames: []string{
-		"Render", "ExecuteTemplate", "Execute", "HTML", "RenderTemplate", "View", "Template",
-	},
-	RenderFunctionName:          "Render",
-	ExecuteTemplateFunctionName: "ExecuteTemplate",
-	SetFunctionNames: []string{
-		"Set", "Locals", "SetVar", "SetContext", "With",
-	},
-	SetFunctionName: "Set",
-	ContextTypeNames: []string{
-		"Context", "Ctx", "fiber.Ctx", "gin.Context", "c.HTML", "echo.Context",
-	},
-	ContextTypeName:    "Context",
-	GlobalTemplateName: "global",
+	RenderFunctionNames: []string{"Render", "ExecuteTemplate", "Execute", "HTML", "RenderTemplate", "View", "Template"},
+	SetFunctionNames:    []string{"Set", "Locals", "SetVar", "SetContext", "With"},
+	ContextTypeNames:    []string{"Context", "Ctx", "fiber.Ctx", "gin.Context", "c.HTML", "echo.Context"},
+	GlobalTemplateName:  "global",
 }
 
 // FuncScope encapsulates all template-related operations within a single

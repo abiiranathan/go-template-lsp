@@ -92,10 +92,7 @@ func extractSetCallVarOptimized(
 
 // isSetterMethod reports whether methodName is in the configured SetFunctionNames slice.
 func isSetterMethod(methodName string, config *AnalysisConfig) bool {
-	if len(config.SetFunctionNames) > 0 && slices.Contains(config.SetFunctionNames, methodName) {
-		return true
-	}
-	return methodName == config.SetFunctionName
+	return slices.Contains(config.SetFunctionNames, methodName)
 }
 
 // isContextReceiver flexibly matches context receivers across frameworks by type name or identifier convention.
@@ -133,10 +130,6 @@ func isContextReceiver(expr goast.Expr, info *types.Info, config *AnalysisConfig
 		if strings.HasSuffix(typeStr, ctxName) {
 			return true
 		}
-	}
-
-	if config.ContextTypeName != "" && strings.HasSuffix(typeStr, config.ContextTypeName) {
-		return true
 	}
 
 	return false

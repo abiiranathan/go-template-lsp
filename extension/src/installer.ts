@@ -7,9 +7,18 @@ import * as util from 'util';
 import { GoResolver } from './goResolver';
 
 const exec = util.promisify(cp.exec);
+const execFile = util.promisify(cp.execFile);
 const MODULE_PATH = 'github.com/abiiranathan/go-template-lsp/gotpl-analyzer';
 const BINARY_NAME = process.platform === 'win32' ? 'gotpl-analyzer.exe' : 'gotpl-analyzer';
 const PROXY_URL = `https://proxy.golang.org/${MODULE_PATH.toLowerCase()}/@latest`;
+
+/**
+ * Minimum interval between automatic (non-interactive) update checks.
+ * Persists across window reloads via globalState so activation does not
+ * hit proxy.golang.org on every startup.
+ */
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_CHECK_STATE_KEY = 'gotpl.lastAutoUpdateCheck';
 
 export class AnalyzerInstaller {
     /**
@@ -23,8 +32,10 @@ export class AnalyzerInstaller {
 
     /**
      * Gets (creating if necessary) the shared GoResolver for this session.
+     * Public so the extension host can hand the same resolver to GoAnalyzer,
+     * letting daemon/CLI spawns inherit the corrected PATH.
      */
-    private static getGoResolver(outputChannel?: vscode.OutputChannel): GoResolver {
+    static getGoResolver(outputChannel?: vscode.OutputChannel): GoResolver {
         if (!this.goResolver) {
             const configuredPath = vscode.workspace.getConfiguration('gotpl').get<string>('goBinaryPath');
             this.goResolver = new GoResolver({
@@ -40,7 +51,9 @@ export class AnalyzerInstaller {
      */
     static async getInstalledVersion(analyzerPath: string): Promise<string | null> {
         try {
-            const { stdout } = await exec(`${GoResolver.quote(analyzerPath)} -version`);
+            // execFile avoids shell interpolation pitfalls for exotic paths
+            // (spaces are handled, but embedded quotes would break `exec`).
+            const { stdout } = await execFile(analyzerPath, ['-version']);
             const version = stdout.trim();
             return version ? version : null;
         } catch {
@@ -158,7 +171,11 @@ export class AnalyzerInstaller {
             cancellable: false,
         }, async () => {
             const resolver = this.getGoResolver(outputChannel);
-            const { binaryPath: goBinary } = await resolver.resolveGoBinary();
+            // Explicit user action: re-probe instead of replaying a cached
+            // (possibly negative) resolution from earlier in the session.
+            const resolution = await resolver.resolveGoBinary(true);
+            outputChannel.appendLine(`[Installer] Go binary resolution for install: ${resolution.binaryPath ?? 'not found'} (via ${resolution.source})`);
+            const { binaryPath: goBinary } = resolution;
             if (!goBinary) {
                 const msg = 'Could not locate the "go" executable. Ensure Go is installed, or set "gotpl.goBinaryPath" in settings to its full path.';
                 outputChannel.appendLine(`[Installer] ${msg}`);
@@ -212,8 +229,14 @@ export class AnalyzerInstaller {
 
         let analyzerPath = await this.getAnalyzerPath(outputChannel);
         if (analyzerPath) {
-            // Check for updates in background on startup (non-interactive)
-            void this.checkForUpdates(analyzerPath, outputChannel, false);
+            // Check for updates in background on startup (non-interactive),
+            // throttled to at most once per day via globalState.
+            const lastCheck = context.globalState.get<number>(UPDATE_CHECK_STATE_KEY) ?? 0;
+            if (Date.now() - lastCheck > UPDATE_CHECK_INTERVAL_MS) {
+                void context.globalState
+                    .update(UPDATE_CHECK_STATE_KEY, Date.now())
+                    .then(() => this.checkForUpdates(analyzerPath!, outputChannel, false));
+            }
             return analyzerPath;
         }
 

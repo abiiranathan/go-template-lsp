@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import {
     FieldInfo,
     ScopeFrame,
@@ -12,6 +13,71 @@ import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { inferExpressionType } from './compiler/expressionParser';
 
 // ── Module-level helpers ───────────────────────────────────────────────────────
+
+/** Normalizes a filesystem path for tolerant comparison (slashes + lowercase). */
+export function normalizeFsPath(p: string): string {
+    return path.normalize(p).replace(/\\/g, '/').toLowerCase();
+}
+
+/**
+ * Finds an open text document matching absolutePath, tolerating drive-letter
+ * and segment casing differences (notably Windows `c:\foo` vs `C:\foo`).
+ */
+export function findOpenDocument(absolutePath: string): vscode.TextDocument | undefined {
+    const norm = normalizeFsPath(absolutePath);
+    return vscode.workspace.textDocuments.find(d => normalizeFsPath(d.uri.fsPath) === norm);
+}
+
+/**
+ * Walks the AST looking for a template/block/define node whose quoted name
+ * spans the cursor position. Returns the name string or null.
+ *
+ * Single source of truth previously duplicated across HoverProvider,
+ * DefinitionProvider, and ReferenceProvider (the copies had drifted: some
+ * did not descend into else-branches).
+ */
+export function findTemplateNameAtPosition(
+    nodes: TemplateNode[],
+    position: vscode.Position
+): string | null {
+    for (const node of nodes) {
+        if (
+            (node.kind === 'partial' || node.kind === 'block' || node.kind === 'define') &&
+            (node.partialName || node.blockName)
+        ) {
+            const name = (node.partialName || node.blockName)!;
+
+            // Locate the quoted name inside the raw tag text, e.g.
+            //   {{ template "my-block" . }}
+            //            ^^^^^^^^^^^
+            const quoteIndex = node.rawText.indexOf(`"${name}"`);
+            if (quoteIndex !== -1) {
+                // quoteIndex is relative to rawText; node.col is 1-based, so
+                // the absolute start column of the opening quote is
+                // (node.col - 1) + quoteIndex. The name starts after that quote.
+                const nameStartCol = (node.col - 1) + quoteIndex + 1;
+                if (
+                    position.line === node.line - 1 &&
+                    position.character >= nameStartCol &&
+                    position.character <= nameStartCol + name.length
+                ) {
+                    return name;
+                }
+            }
+        }
+
+        if (node.children) {
+            const found = findTemplateNameAtPosition(node.children, position);
+            if (found) return found;
+        }
+        if (node.elseChildren) {
+            const found = findTemplateNameAtPosition(node.elseChildren, position);
+            if (found) return found;
+        }
+    }
+    return null;
+}
+
 
 /** Converts a FieldInfo record into a TemplateVar. */
 export function fieldInfoToTemplateVar(f: FieldInfo): TemplateVar {
@@ -69,7 +135,14 @@ export function normalizeDictArg(contextArg: string): string {
 export class ScopeUtils {
     readonly parser: TemplateParser;
     readonly graphBuilder: KnowledgeGraphBuilder;
-    private namedBlockCallCtxCache = new Map<string, any>();
+
+    /**
+     * Static cache of named-block call-context resolutions shared by every
+     * ScopeUtils instance. KnowledgeGraphBuilder.build() clears it via
+     * clearAllCaches() so entries never outlive the graph they were
+     * computed against.
+     */
+    private static namedBlockCallCtxCache = new Map<string, any>();
 
     constructor(parser: TemplateParser, graphBuilder: KnowledgeGraphBuilder) {
         this.parser = parser;
@@ -77,7 +150,12 @@ export class ScopeUtils {
     }
 
     clearCache(): void {
-        this.namedBlockCallCtxCache.clear();
+        ScopeUtils.namedBlockCallCtxCache.clear();
+    }
+
+    /** Clears every shared cache. Called on graph rebuilds. */
+    static clearAllCaches(): void {
+        ScopeUtils.namedBlockCallCtxCache.clear();
     }
 
     // ── Named block registry ──────────────────────────────────────────────────
@@ -1083,12 +1161,12 @@ export class ScopeUtils {
         isSlice?: boolean;
     } | null {
         const cacheKey = `${blockName}:${currentFilePath || ''}`;
-        if (this.namedBlockCallCtxCache.has(cacheKey)) {
-            return this.namedBlockCallCtxCache.get(cacheKey) ?? null;
+        if (ScopeUtils.namedBlockCallCtxCache.has(cacheKey)) {
+            return ScopeUtils.namedBlockCallCtxCache.get(cacheKey) ?? null;
         }
 
         const result = this._resolveNamedBlockCallCtxUncached(blockName, vars, currentFileNodes, currentFilePath);
-        this.namedBlockCallCtxCache.set(cacheKey, result);
+        ScopeUtils.namedBlockCallCtxCache.set(cacheKey, result);
         return result;
     }
 
@@ -1142,11 +1220,15 @@ export class ScopeUtils {
             return localCtx;
         }
 
-        for (const [, templateCtx] of graph.templates) {
-            if (!templateCtx.absolutePath) continue;
-            if (currentFilePath && templateCtx.absolutePath === currentFilePath) continue;
-            const fileNodes = this.graphBuilder.getParsedNodes(templateCtx.absolutePath);
-            if (!fileNodes) continue;
+        // Fast path: inspect only templates the partial-call index knows call
+        // this block name. Falls back to the full template scan when the index
+        // yields nothing, preserving previous behavior for exotic call sites.
+        const resolveFromTemplate = (templateCtx: TemplateContext): { typeStr: string; fields?: FieldInfo[]; isMap?: boolean; keyType?: string; elemType?: string; isSlice?: boolean } | null => {
+            const absPath = templateCtx.absolutePath;
+            if (!absPath) return null;
+            if (currentFilePath && absPath === currentFilePath) return null;
+            const fileNodes = this.graphBuilder.getParsedNodes(absPath);
+            if (!fileNodes) return null;
             const callCtx = this.findCallSiteContext(
                 fileNodes, blockName, templateCtx.vars, []
             );
@@ -1159,6 +1241,21 @@ export class ScopeUtils {
                 }
                 return callCtx;
             }
+            return null;
+        };
+
+        const candidatePaths = this.graphBuilder.getParentCandidates(blockName);
+        for (const abs of candidatePaths) {
+            const templateCtx = graph.templates.get(abs)
+                ?? [...graph.templates.values()].find(t => t.absolutePath === abs);
+            if (!templateCtx) continue;
+            const resolved = resolveFromTemplate(templateCtx);
+            if (resolved) return resolved;
+        }
+
+        for (const [, templateCtx] of graph.templates) {
+            const resolved = resolveFromTemplate(templateCtx);
+            if (resolved) return resolved;
         }
 
         if (localCtx) {

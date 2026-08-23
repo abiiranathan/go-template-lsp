@@ -16,7 +16,7 @@ import {
 } from './types';
 import { TemplateParser, resolvePath } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
-import { ScopeUtils, isFileBasedPartial } from './scopeUtils';
+import { ScopeUtils, isFileBasedPartial, findOpenDocument, findTemplateNameAtPosition } from './scopeUtils';
 import { HoverProvider } from './hoverProvider';
 import path from 'path';
 
@@ -253,42 +253,18 @@ export class DefinitionProvider {
         position: vscode.Position,
         ctx: TemplateContext
     ): Promise<vscode.Location | null> {
-        for (const node of nodes) {
-            if (
-                (node.kind === 'partial' || node.kind === 'block' || node.kind === 'define') &&
-                (node.partialName || node.blockName)
-            ) {
-                const name = node.partialName || node.blockName!;
-                const nameMatch = node.rawText.match(
-                    new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`)
+        const name = findTemplateNameAtPosition(nodes, position);
+        if (!name) return null;
+
+        if (isFileBasedPartial(name)) {
+            const templatePath = this.graphBuilder.resolveTemplatePath(name);
+            if (templatePath) {
+                return new vscode.Location(
+                    vscode.Uri.file(templatePath), new vscode.Position(0, 0)
                 );
-                if (nameMatch && nameMatch[2] === name) {
-                    const nameStartCol =
-                        (node.col - 1) + node.rawText.indexOf('"' + name + '"') + 1;
-                    if (
-                        position.line === node.line - 1 &&
-                        position.character >= nameStartCol &&
-                        position.character <= nameStartCol + name.length
-                    ) {
-                        if (isFileBasedPartial(name)) {
-                            const templatePath = this.graphBuilder.resolveTemplatePath(name);
-                            if (templatePath) {
-                                return new vscode.Location(
-                                    vscode.Uri.file(templatePath), new vscode.Position(0, 0)
-                                );
-                            }
-                        } else {
-                            return await this.findNamedBlockDefinitionLocation(name, ctx);
-                        }
-                    }
-                }
             }
-            if (node.children) {
-                const found = await this.findPartialDefinitionAtPosition(
-                    node.children, position, ctx
-                );
-                if (found) return found;
-            }
+        } else {
+            return await this.findNamedBlockDefinitionLocation(name, ctx);
         }
         return null;
     }
@@ -316,9 +292,7 @@ export class DefinitionProvider {
 
         for (const filePath of filesToSearch) {
             try {
-                const openDoc = vscode.workspace.textDocuments.find(
-                    d => d.uri.fsPath === filePath
-                );
+                const openDoc = findOpenDocument(filePath);
                 let content = openDoc ? openDoc.getText() : '';
                 if (!content) {
                     if (!fs.existsSync(filePath)) continue;

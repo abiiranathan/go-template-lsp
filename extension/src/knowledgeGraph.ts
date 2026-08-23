@@ -16,7 +16,7 @@ import {
     extractBareType,
 } from './types';
 import { TemplateParser, resolvePath } from './templateParser';
-import { normalizeDictArg } from './scopeUtils';
+import { normalizeDictArg, fieldInfoToTemplateVar, ScopeUtils, findOpenDocument, normalizeFsPath } from './scopeUtils';
 import { inferExpressionType } from './compiler/expressionParser';
 import { config } from './config';
 
@@ -38,6 +38,13 @@ export class KnowledgeGraphBuilder {
     private readonly statusBarItem: vscode.StatusBarItem;
     private partialContextCache = new Map<string, TemplateContext | null>();
 
+    /**
+     * Memoized file-existence results, cleared on every graph rebuild and on
+     * incremental template updates. Avoids per-request existsSync storms in
+     * resolveTemplatePath / partial-parent fallback scans.
+     */
+    private existenceCache = new Map<string, boolean>();
+
     constructor(
         workspaceRoot: string,
         outputChannel: vscode.OutputChannel,
@@ -48,22 +55,34 @@ export class KnowledgeGraphBuilder {
         this.statusBarItem = statusBarItem;
     }
 
-    updateStatus(message: string): void {
-        this.statusBarItem.text = `$(sync~spin) ${message}`;
-        this.statusBarItem.show();
-        this.outputChannel.appendLine(`[KnowledgeGraph] ${message}`);
-    }
-
-    clearStatus(): void {
-        this.statusBarItem.hide();
-    }
-
     getRelativeGoFile(absolutePath: string): string | null {
         const sourceDir: string = config.sourceDir();
         const sourceDirAbs = path.resolve(this.workspaceRoot, sourceDir);
         const rel = path.relative(sourceDirAbs, absolutePath);
         if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
         return rel.replace(/\\/g, '/');
+    }
+
+    /**
+     * Returns absolute paths of templates known (from the pre-built
+     * partialToParents index) to invoke the given partial / named-block name.
+     * Lets position-based lookups skip O(all-templates) AST walks in the
+     * common case.
+     */
+    getParentCandidates(partialName: string): string[] {
+        const result = new Set<string>();
+        const direct = this.partialToParents.get(partialName);
+        if (direct) {
+            for (const p of direct) result.add(p);
+        }
+        const base = path.basename(partialName);
+        if (base !== partialName) {
+            const byBase = this.partialToParents.get(base);
+            if (byBase) {
+                for (const p of byBase) result.add(p);
+            }
+        }
+        return [...result];
     }
 
     private getTemplateBase(): string {
@@ -85,7 +104,7 @@ export class KnowledgeGraphBuilder {
 
         let content: string;
         try {
-            const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === absolutePath);
+            const openDoc = findOpenDocument(absolutePath);
             content = openDoc ? openDoc.getText() : fs.readFileSync(absolutePath, 'utf8');
         } catch (err) {
             return undefined;
@@ -110,7 +129,13 @@ export class KnowledgeGraphBuilder {
         this.astCache.clear();
         this.absPathToContext.clear();
         this.partialToParents.clear();
+        this.existenceCache.clear();
         TemplateParser.clearCache();
+        // ScopeUtils keeps its own cross-request cache (named-block call
+        // contexts). It must be invalidated here too, otherwise hover /
+        // completion / definition inside named blocks keep serving types from
+        // the previous graph until the window reloads.
+        ScopeUtils.clearAllCaches();
 
         const templates = new Map<string, TemplateContext>();
         const templateBase = this.getTemplateBase();
@@ -306,7 +331,7 @@ export class KnowledgeGraphBuilder {
             name,
             get node() {
                 if (!(this as any)._node) {
-                    const nodes = knowledgeGraphBuilder.getParsedNodes(this.absolutePath);
+                    const nodes = knowledgeGraphBuilder?.getParsedNodes(this.absolutePath);
                     const found = nodes ? findBlockNode(nodes, name) : undefined;
                     (this as any)._node = found ?? {
                         kind: 'define',
@@ -363,12 +388,15 @@ export class KnowledgeGraphBuilder {
     }
 
     async findContextForFileAsPartialAsync(absolutePath: string): Promise<TemplateContext | undefined> {
-        if (this.partialContextCache.has(absolutePath)) {
-            return this.partialContextCache.get(absolutePath) ?? undefined;
+        // Normalize the cache key so Windows casing variants share entries
+        // instead of creating duplicate/stale ones.
+        const cacheKey = normalizeFsPath(absolutePath);
+        if (this.partialContextCache.has(cacheKey)) {
+            return this.partialContextCache.get(cacheKey) ?? undefined;
         }
 
         const result = await this._findContextForFileAsPartialUncached(absolutePath);
-        this.partialContextCache.set(absolutePath, result ?? null);
+        this.partialContextCache.set(cacheKey, result ?? null);
         return result;
     }
 
@@ -429,7 +457,7 @@ export class KnowledgeGraphBuilder {
             }
         } else {
             parentEntries = [...this.graph.templates.entries()].filter(
-                ([, ctx]) => ctx.absolutePath && fs.existsSync(ctx.absolutePath)
+                ([, ctx]) => ctx.absolutePath && this.fileExistsCached(ctx.absolutePath)
             );
         }
 
@@ -571,22 +599,23 @@ export class KnowledgeGraphBuilder {
     }
 
     resolveGoFilePath(relativeFile: string): string | null {
-        const config = vscode.workspace.getConfiguration('rex');
-        const sourceDir: string = config.get('sourceDir') ?? '.';
+        // Use the central gotpl config (a previous version read the legacy
+        // 'rex' namespace here, resolving definitions against the wrong root).
+        const sourceDir: string = config.sourceDir();
         const sourceDirAbs = path.resolve(this.workspaceRoot, sourceDir);
         const abs = path.join(sourceDirAbs, relativeFile);
-        return fs.existsSync(abs) ? abs : null;
+        return this.fileExistsCached(abs) ? abs : null;
     }
 
     resolveTemplatePath(templatePath: string): string | null {
         const ctx = this.graph.templates.get(templatePath);
-        if (ctx?.absolutePath && fs.existsSync(ctx.absolutePath)) {
+        if (ctx?.absolutePath && this.fileExistsCached(ctx.absolutePath)) {
             return ctx.absolutePath;
         }
 
         for (const [tplPath, tplCtx] of this.graph.templates) {
             if (tplPath.endsWith(templatePath) || templatePath.endsWith(tplPath)) {
-                if (tplCtx.absolutePath && fs.existsSync(tplCtx.absolutePath)) {
+                if (tplCtx.absolutePath && this.fileExistsCached(tplCtx.absolutePath)) {
                     return tplCtx.absolutePath;
                 }
             }
@@ -599,7 +628,7 @@ export class KnowledgeGraphBuilder {
         ];
 
         for (const candidate of candidates) {
-            if (fs.existsSync(candidate)) {
+            if (this.fileExistsCached(candidate)) {
                 return candidate;
             }
         }
@@ -607,9 +636,24 @@ export class KnowledgeGraphBuilder {
         return null;
     }
 
+    /** Memoized fs.existsSync; cache is dropped on rebuild/template update. */
+    private fileExistsCached(absPath: string): boolean {
+        let exists = this.existenceCache.get(absPath);
+        if (exists === undefined) {
+            try {
+                exists = fs.existsSync(absPath);
+            } catch {
+                exists = false;
+            }
+            this.existenceCache.set(absPath, exists);
+        }
+        return exists;
+    }
+
     updateTemplateFile(absolutePath: string, content: string) {
         this.invalidateAstCache(absolutePath);
         this.partialContextCache.clear();
+        this.existenceCache.delete(absolutePath);
         this.absPathToContext.delete(path.normalize(absolutePath).toLowerCase());
         const ctx = this.findContextForFile(absolutePath);
         if (ctx && ctx.absolutePath) {
@@ -619,19 +663,6 @@ export class KnowledgeGraphBuilder {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function fieldInfoToTemplateVar(f: FieldInfo): TemplateVar {
-    return {
-        name: f.name,
-        type: f.type,
-        fields: f.fields,
-        isSlice: f.isSlice,
-        defFile: f.defFile,
-        defLine: f.defLine,
-        defCol: f.defCol,
-        doc: f.doc,
-    };
-}
 
 function hydrateVar(v: TemplateVar, typeRegistry: Map<string, FieldInfo[]>): TemplateVar {
     if (v.fields && v.fields.length > 0) return v;
@@ -663,11 +694,13 @@ function maxFieldDepth(
     for (const f of fields) {
         const bare = extractBareType(f.type);
         if (bare && visited.has(bare)) continue;
-        const childVisited = bare ? new Set([...visited, bare]) : visited;
+        // Backtrack a shared visited set instead of allocating a copy per field.
+        if (bare) visited.add(bare);
         const childFields = f.fields && f.fields.length > 0
             ? f.fields
             : typeRegistry?.get(bare) ?? [];
-        const d = 1 + maxFieldDepth(childFields, typeRegistry, childVisited);
+        const d = 1 + maxFieldDepth(childFields, typeRegistry, visited);
+        if (bare) visited.delete(bare);
         if (d > max) max = d;
     }
     return max;
@@ -682,11 +715,15 @@ function findBlockNode(nodes: TemplateNode[], name: string): TemplateNode | unde
             const found = findBlockNode(n.children, name);
             if (found) return found;
         }
+        if (n.elseChildren) {
+            const found = findBlockNode(n.elseChildren, name);
+            if (found) return found;
+        }
     }
     return undefined;
 }
 
-let knowledgeGraphBuilder: KnowledgeGraphBuilder;
+let knowledgeGraphBuilder: KnowledgeGraphBuilder | undefined;
 
 export function setKnowledgeGraphBuilder(builder: KnowledgeGraphBuilder) {
     knowledgeGraphBuilder = builder;

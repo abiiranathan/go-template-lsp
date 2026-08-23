@@ -7,6 +7,7 @@ import { createGunzip } from 'zlib';
 
 import { AnalysisResult, ExpressionTypeResult, GoTemplateValidationResult, ScopeFrame, TemplateVar } from './types';
 import { config } from './config';
+import { GoResolver } from './goResolver';
 
 interface AnalyzerRequest {
   jsonrpc: '2.0';
@@ -25,6 +26,18 @@ interface AnalyzerResponse<T> {
   };
 }
 
+/**
+ * Per-method daemon request timeouts. Without these a hung daemon leaves
+ * pending promises unresolved forever, freezing hover/completion awaits.
+ * Analysis methods get a generous budget (large repos type-check slowly);
+ * interactive methods time out quickly enough to stay responsive.
+ */
+const DAEMON_REQUEST_TIMEOUT_MS: Record<string, number> = {
+  analyze: 120_000,
+  reanalyzeTemplates: 60_000,
+};
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
 export class GoAnalyzer {
   private analyzerPath: string;
   private outputChannel: vscode.OutputChannel;
@@ -35,10 +48,39 @@ export class GoAnalyzer {
     resolve: (value: unknown) => void;
     reject: (reason?: unknown) => void;
   }>();
+  private goResolver?: GoResolver;
 
-  constructor(resolvedAnalyzerPath: string, outputChannel: vscode.OutputChannel) {
+  constructor(
+    resolvedAnalyzerPath: string,
+    outputChannel: vscode.OutputChannel,
+    goResolver?: GoResolver,
+  ) {
     this.outputChannel = outputChannel;
     this.analyzerPath = this.resolveAnalyzerPath(resolvedAnalyzerPath);
+    // When provided, the resolver supplies a child environment whose PATH
+    // contains the resolved `go` binary directory. The analyzer daemon needs
+    // `go` itself (packages.Load shells out to `go list`), and the extension
+    // host's inherited PATH frequently misses it — the same reason
+    // installation fails without GoResolver.
+    this.goResolver = goResolver;
+  }
+
+  /**
+   * Environment for spawned analyzer processes, with the resolved go binary
+   * directory prepended to PATH when available.
+   */
+  private async spawnEnv(): Promise<NodeJS.ProcessEnv> {
+    if (this.goResolver) {
+      try {
+        const { binaryPath } = await this.goResolver.resolveGoBinary();
+        if (binaryPath) {
+          return this.goResolver.buildChildEnv(binaryPath) as NodeJS.ProcessEnv;
+        }
+      } catch {
+        // Fall through to process.env.
+      }
+    }
+    return process.env;
   }
 
   /**
@@ -208,12 +250,9 @@ export class GoAnalyzer {
       } catch {
         // Ignore shutdown errors and terminate below.
       }
-      this.daemonProcess.kill();
     }
 
-    this.daemonReader?.close();
-    this.daemonReader = undefined;
-    this.daemonProcess = undefined;
+    this.killDaemon();
 
     for (const pending of this.pendingRequests.values()) {
       pending.reject(new Error('Analyzer daemon disposed'));
@@ -309,13 +348,15 @@ export class GoAnalyzer {
 
     this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);
 
+    const childEnv = await this.spawnEnv();
+
     return new Promise((resolve) => {
       let stdout = '';
       let stderr = '';
 
       const proc = cp.spawn(this.analyzerPath, args, {
         cwd: workspaceRoot,
-        env: process.env,
+        env: childEnv,
       });
 
       // If compression is enabled, decompress first
@@ -407,17 +448,49 @@ export class GoAnalyzer {
     };
 
     return new Promise<T>((resolve, reject) => {
+      // Guard against a hung daemon: time out, fail the request, and kill the
+      // process so the next request starts a fresh daemon.
+      const timeoutMs = DAEMON_REQUEST_TIMEOUT_MS[method] ?? DEFAULT_REQUEST_TIMEOUT_MS;
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        this.outputChannel.appendLine(
+          `[Analyzer] Daemon request '${method}' (id=${id}) timed out after ${timeoutMs}ms; restarting daemon.`
+        );
+        this.killDaemon();
+        reject(new Error(`Analyzer daemon request '${method}' timed out`));
+      }, timeoutMs);
+
       this.pendingRequests.set(id, {
-        resolve: (value) => resolve(value as T),
-        reject,
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value as T);
+        },
+        reject: (reason) => {
+          clearTimeout(timer);
+          reject(reason);
+        },
       });
       this.daemonProcess!.stdin.write(`${JSON.stringify(request)}\n`, (err) => {
         if (err) {
+          clearTimeout(timer);
           this.pendingRequests.delete(id);
           reject(err);
         }
       });
     });
+  }
+
+  private killDaemon(): void {
+    if (this.daemonProcess && !this.daemonProcess.killed) {
+      try {
+        this.daemonProcess.kill();
+      } catch {
+        // Best effort.
+      }
+    }
+    this.daemonReader?.close();
+    this.daemonReader = undefined;
+    this.daemonProcess = undefined;
   }
 
   private async ensureDaemonStarted(workspaceRoot: string): Promise<void> {
@@ -428,7 +501,7 @@ export class GoAnalyzer {
     this.outputChannel.appendLine('[Analyzer] Starting daemon...');
     const proc = cp.spawn(this.analyzerPath, ['-daemon'], {
       cwd: workspaceRoot,
-      env: process.env,
+      env: await this.spawnEnv(),
       stdio: 'pipe',
     });
 

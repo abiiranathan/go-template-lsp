@@ -23,6 +23,8 @@ import { KnowledgeGraph, GoValidationError, NamedBlockDuplicateError, RenderCall
 
 import { config } from './config';
 import { AnalyzerInstaller } from './installer';
+import { TemplateParser } from './templateParser';
+import { GoResolver } from './goResolver';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -49,6 +51,12 @@ const GO_SELECTOR: vscode.DocumentSelector = [
 
 /** Flag indicating whether the initial index has been executed. */
 let isInitialized = false;
+
+/**
+ * Workspace root chosen at activation (prefers the folder containing go.mod).
+ * Used by helpers that need the analysis root without re-guessing folder[0].
+ */
+let activeWorkspaceRoot: string | undefined;
 
 // ─── Module-Level State ───────────────────────────────────────────────────────
 
@@ -167,12 +175,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return;
   }
 
-  // 4. Resolve workspace root folder
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!workspaceRoot) {
+  // 4. Resolve workspace root folder.
+  // Prefer the first folder that actually contains a go.mod so multi-root
+  // workspaces don't silently index an unrelated folder; fall back to the
+  // first folder and log the choice either way.
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
     outputChannel.appendLine('[GoTpl] No workspace folder found. Go Template LSP inactive.');
     return;
   }
+  let workspaceRoot = folders[0].uri.fsPath;
+  const goModFolder = folders.find(
+    (f) => fs.existsSync(path.join(f.uri.fsPath, 'go.mod'))
+  );
+  if (goModFolder && goModFolder !== folders[0]) {
+    workspaceRoot = goModFolder.uri.fsPath;
+    outputChannel.appendLine(`[GoTpl] Multiple workspace folders found; using "${goModFolder.name}" (contains go.mod).`);
+  } else if (folders.length > 1) {
+    outputChannel.appendLine(`[GoTpl] Multiple workspace folders found; using "${folders[0].name}".`);
+  }
+  activeWorkspaceRoot = workspaceRoot;
 
   // 5. Ensure the analyzer binary exists or prompt user / download / build in dev mode
   const analyzerExecutablePath = await AnalyzerInstaller.ensureInstalled(context, outputChannel);
@@ -181,10 +203,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return;
   }
 
-  // 6. Instantiate core engine components
-  analyzer = new GoAnalyzer(analyzerExecutablePath, outputChannel);
+  // 6. Instantiate core engine components.
+  // Reuse the installer's GoResolver so the daemon and CLI spawns inherit the
+  // corrected PATH (the analyzer itself needs `go` for packages.Load — the
+  // extension host's PATH often misses it, which previously made analysis
+  // fail with "'go': executable file not found" even right after a
+  // successful install).
+  const goResolver = AnalyzerInstaller.getGoResolver(outputChannel);
+  analyzer = new GoAnalyzer(analyzerExecutablePath, outputChannel, goResolver);
   graphBuilder = new KnowledgeGraphBuilder(workspaceRoot, outputChannel, statusBarItem);
   setKnowledgeGraphBuilder(graphBuilder);
+
+  // Surface silent template-parse failures in the output channel
+  TemplateParser.setLogSink((message) => outputChannel.appendLine(message));
+
   validator = new TemplateValidator(outputChannel, graphBuilder, analyzer);
 
   // ── Register User Commands ──────────────────────────────────────────────────
@@ -719,6 +751,37 @@ async function applyAnalyzerDiagnostics(
     const list = issuesByFile.get(diagnosticFilePath) ?? [];
     list.push(diag);
     issuesByFile.set(diagnosticFilePath, list);
+
+    // gotpl.showCallSiteErrors: additionally surface the error at the
+    // template/block call site itself (in addition to the source location).
+    if (
+      config.showCallSiteErrors() &&
+      err.sourceTemplate && err.sourceLine
+    ) {
+      const callSitePath = path.join(baseDir, templateRoot, err.template);
+      const csLine = Math.max(0, err.line - 1);
+      const csCol = Math.max(0, err.column - 1);
+      const csEndCol = csCol + (err.variable?.length || 1);
+      const callSiteDiag = new vscode.Diagnostic(
+        new vscode.Range(csLine, csCol, csLine, csEndCol),
+        `${err.message} (via partial "${err.sourceTemplate}")`,
+        err.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error
+      );
+      callSiteDiag.source = 'GoTpl';
+      callSiteDiag.relatedInformation = [
+        new vscode.DiagnosticRelatedInformation(
+          new vscode.Location(
+            vscode.Uri.file(diagnosticFilePath),
+            new vscode.Range(diagnosticLine, diagnosticCol, diagnosticLine, diagnosticEndCol)
+          ),
+          `Originates in ${err.sourceTemplate}`
+        ),
+      ];
+
+      const csList = issuesByFile.get(callSitePath) ?? [];
+      csList.push(callSiteDiag);
+      issuesByFile.set(callSitePath, csList);
+    }
   }
 
   for (const [filePath, issues] of issuesByFile) {
@@ -747,7 +810,7 @@ async function validateDocument(doc: vscode.TextDocument, requestedVersion: numb
     return;
   }
 
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  const workspaceRoot = activeWorkspaceRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!workspaceRoot) {
     editorCollection.delete(doc.uri);
     return;

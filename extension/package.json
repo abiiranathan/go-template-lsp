@@ -2,7 +2,7 @@
   "name": "go-template-lsp",
   "displayName": "Go Template LSP (Language Server)",
   "description": "Language Server Protocol extension for Go templates: validation, intellisense, go to definition, and more.",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "publisher": "yomedicalfiles",
   "icon": "logo.png",
   "repository": {
@@ -92,6 +92,11 @@
           "type": "string",
           "default": "",
           "description": "Path to the gotpl analyzer binary. Leave empty to use the bundled binary."
+        },
+        "gotpl.goBinaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Full path to the 'go' executable used to install/update and run the analyzer (e.g. /usr/local/go/bin/go). Only needed when automatic detection fails, e.g. Go is installed via a version manager not visible to VS Code."
         },
         "gotpl.sourceDir": {
           "type": "string",

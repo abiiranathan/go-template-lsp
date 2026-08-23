@@ -8,6 +8,12 @@ import { FieldInfo, ScopeFrame, TemplateNode, TemplateVar, ParamInfo, extractBar
 export class TemplateParser {
     private static parseCache = new Map<string, TemplateNode[]>();
     private static readonly MAX_CACHE_SIZE = 200;
+    private static logSink: ((message: string) => void) | undefined;
+
+    /** Optional logging hook so parse failures surface in the GoTpl output channel. */
+    static setLogSink(sink: (message: string) => void): void {
+        TemplateParser.logSink = sink;
+    }
 
     static clearCache(): void {
         TemplateParser.parseCache.clear();
@@ -17,6 +23,10 @@ export class TemplateParser {
         if (!content) return [];
         const cached = TemplateParser.parseCache.get(content);
         if (cached) {
+            // Re-insert to refresh ordering so hot entries behave LRU-wise
+            // instead of being evicted FIFO by one-off parses.
+            TemplateParser.parseCache.delete(content);
+            TemplateParser.parseCache.set(content, cached);
             return cached;
         }
 
@@ -32,8 +42,16 @@ export class TemplateParser {
             }
             TemplateParser.parseCache.set(content, nodes);
             return nodes;
-        } catch {
-            // Graceful fallback for incomplete/broken syntax during typing
+        } catch (err) {
+            // Graceful fallback for incomplete/broken syntax during typing —
+            // but never silently: previously even catastrophic failures
+            // (e.g. stack overflow on deep recursion) vanished without a trace.
+            const message = `[GoTpl] Template parse failed; language features degrade for this buffer until syntax recovers: ${err}`;
+            if (TemplateParser.logSink) {
+                TemplateParser.logSink(message);
+            } else {
+                console.warn(message);
+            }
             return [];
         }
     }
@@ -336,7 +354,11 @@ export class TemplateParser {
             pos++;
         }
 
-        return { nodes, nextPos: pos, endToken: tokens[pos - 1] };
+        // Ran off the end of the token stream without seeing `end`/`else`
+        // (unclosed block while typing). Leave endToken undefined so nodes
+        // report no end position; consumers then treat the block as
+        // open-ended instead of bounding it at an unrelated token.
+        return { nodes, nextPos: pos };
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
@@ -880,7 +902,9 @@ function resolveFields(
     }
 
     if (parts[0] === '[]' || isMap) {
-        const rest = parts[0] === '[]' ? parts.slice(1) : parts.slice(1);
+        // Both the slice marker ('[]') and the map variable name occupy
+        // parts[0] and are dropped before resolving element fields.
+        const rest = parts.slice(1);
 
         // ONLY strip pointers here so we can manually inspect map/slice prefixes
         let nextTypeStr = (elemType || 'unknown').trim();

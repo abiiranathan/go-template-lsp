@@ -188,14 +188,27 @@ func BuildPropagatedRenderVarIndex(
 		inQueue[name] = true
 	}
 
+	// Pre-normalize store paths once so the suffix-match fallback in
+	// getContent does not call normalizePath per entry per lookup (which made
+	// lookups O(store) with expensive Clean+ToLower on every iteration).
+	type normStoreEntry struct {
+		normPath string
+		content  string
+	}
+	normStore := make([]normStoreEntry, 0, len(store))
+	for absPath, content := range store {
+		normStore = append(normStore, normStoreEntry{normPath: normalizePath(absPath), content: content})
+	}
+
 	getContent := func(name string) string {
 		absPath := filepath.Join(baseDir, templateRoot, name)
 		if content, ok := store[absPath]; ok {
 			return content
 		}
-		for storeAbs, content := range store {
-			if strings.HasSuffix(normalizePath(storeAbs), normalizePath(name)) {
-				return content
+		normName := normalizePath(name)
+		for _, e := range normStore {
+			if strings.HasSuffix(e.normPath, normName) {
+				return e.content
 			}
 		}
 		if entries, ok := namedBlocks[name]; ok && len(entries) > 0 {
@@ -298,6 +311,13 @@ func validateTemplateTreeFromStore(
 		vars    []ast.TemplateVar
 	}
 
+	// Pre-normalize render-var index keys once so isCoveredByRenderCall does
+	// not re-normalize every key for every store entry.
+	normIndexKeys := make([]string, 0, len(renderVarsByTemplate))
+	for key := range renderVarsByTemplate {
+		normIndexKeys = append(normIndexKeys, normalizeTemplateKeyRel(key))
+	}
+
 	var items []workItem
 	for absPath, content := range store {
 		rel, err := filepath.Rel(root, absPath)
@@ -306,7 +326,7 @@ func validateTemplateTreeFromStore(
 		}
 		rel = filepath.ToSlash(rel)
 
-		if isCoveredByRenderCall(rel, renderVarsByTemplate) {
+		if isCoveredByRenderCall(rel, renderVarsByTemplate, normIndexKeys) {
 			continue
 		}
 
@@ -341,15 +361,19 @@ func validateTemplateTreeFromStore(
 	})
 }
 
-func isCoveredByRenderCall(rel string, renderVarsByTemplate map[string][]ast.TemplateVar) bool {
+// normalizeTemplateKeyRel cleans a template index key the same way
+// isCoveredByRenderCall normalizes both sides before comparison.
+func normalizeTemplateKeyRel(key string) string {
+	normalized := filepath.ToSlash(filepath.Clean(key))
+	return strings.TrimPrefix(normalized, "./")
+}
+
+func isCoveredByRenderCall(rel string, renderVarsByTemplate map[string][]ast.TemplateVar, normIndexKeys []string) bool {
 	if _, ok := renderVarsByTemplate[rel]; ok {
 		return true
 	}
-	normalizedRel := filepath.ToSlash(filepath.Clean(rel))
-	normalizedRel = strings.TrimPrefix(normalizedRel, "./")
-	for key := range renderVarsByTemplate {
-		normalizedKey := filepath.ToSlash(filepath.Clean(key))
-		normalizedKey = strings.TrimPrefix(normalizedKey, "./")
+	normalizedRel := normalizeTemplateKeyRel(rel)
+	for _, normalizedKey := range normIndexKeys {
 		if normalizedRel == normalizedKey {
 			return true
 		}

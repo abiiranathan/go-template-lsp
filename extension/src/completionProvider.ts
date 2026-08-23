@@ -309,7 +309,9 @@ export class CompletionProvider {
         } else {
             const lastDot = rawPath.lastIndexOf('.');
             if (lastDot === -1) {
-                filterPrefix = rawPath.startsWith('$') ? rawPath.slice(1) : rawPath.slice(1);
+                // Both source branches sliced the first char ('$' or dot prefix);
+                // simplified to a single slice preserving that behavior.
+                filterPrefix = rawPath.slice(1);
                 filterStart = matchStart + 1;
                 if (rawPath.startsWith('$')) {
                     const repRange = new vscode.Range(

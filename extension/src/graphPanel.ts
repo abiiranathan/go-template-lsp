@@ -56,6 +56,17 @@ export class KnowledgeGraphPanel {
     return prefix + parts[parts.length - 1];
   }
 
+  /** Escapes text interpolated into the webview HTML (doc comments, file names,
+   *  and type strings come from arbitrary Go source and must never be markup). */
+  private static escapeHtml(value: unknown): string {
+    return String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   private buildHTML(graph: KnowledgeGraph): string {
     const analyzedAt = graph.analyzedAt.toLocaleTimeString();
     const stats = {
@@ -65,26 +76,27 @@ export class KnowledgeGraphPanel {
     };
 
     // Helper to render variable fields recursively
+    const esc = KnowledgeGraphPanel.escapeHtml;
     function renderFields(fields: any[] | undefined, depth = 0): string {
       if (!fields || fields.length === 0) return '';
       return `<details style="margin-left:${depth * 16}px;">\n` +
         `<summary>Fields (${fields.length})</summary>` +
         `<ul style="margin:0; padding-left:16px;">` +
-        fields.map(f => `<li><b>${f.name}</b>: <span>${f.type}</span>${renderFields(f.fields, depth + 1)}</li>`).join('') +
+        fields.map(f => `<li><b>${esc(f.name)}</b>: <span>${esc(f.type)}</span>${renderFields(f.fields, depth + 1)}</li>`).join('') +
         `</ul></details>`;
     }
 
     // Helper to render variables
     function renderVars(vars: Map<string, any>): string {
       if (!vars || vars.size === 0) return '<em>No variables</em>';
-      return `<table class="vars-table">\n        <thead><tr><th>Name</th><th>Type</th><th>Fields</th></tr></thead>\n        <tbody>\n        ${Array.from(vars.values()).map(v => `\n          <tr>\n            <td>${v.name}</td>\n            <td>${v.type}</td>\n            <td>${v.fields && v.fields.length > 0 ? renderFields(v.fields) : '<em>None</em>'}</td>\n          </tr>\n        `).join('')}\n        </tbody>\n      </table>`;
+      return `<table class="vars-table">\n        <thead><tr><th>Name</th><th>Type</th><th>Fields</th></tr></thead>\n        <tbody>\n        ${Array.from(vars.values()).map(v => `\n          <tr>\n            <td>${esc(v.name)}</td>\n            <td>${esc(v.type)}</td>\n            <td>${v.fields && v.fields.length > 0 ? renderFields(v.fields) : '<em>None</em>'}</td>\n          </tr>\n        `).join('')}\n        </tbody>\n      </table>`;
     }
 
     // Helper to render renderCalls
     function renderRenderCalls(renderCalls: any[]): string {
       if (!renderCalls || renderCalls.length === 0) return '<em>No render calls</em>';
       return `<ul>
-        ${renderCalls.map(rc => `<li><b>${rc.file}:${rc.line}</b> (vars: ${rc.vars.map((v: any) => v.name).join(', ')})</li>`).join('')}
+        ${renderCalls.map(rc => `<li><b>${esc(rc.file)}:${esc(rc.line)}</b> (vars: ${rc.vars.map((v: any) => esc(v.name)).join(', ')})</li>`).join('')}
       </ul>`;
     }
 
@@ -94,6 +106,7 @@ export class KnowledgeGraphPanel {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
   <title>Templates Table</title>
   <style>
     body {
@@ -211,7 +224,7 @@ export class KnowledgeGraphPanel {
       <tbody>
         ${Array.from(graph.templates.values()).map(ctx => `
           <tr>
-            <td><b>${ctx.templatePath}</b></td>
+            <td><b>${esc(ctx.templatePath)}</b></td>
             <td>
               <details>
                 <summary>Show Context</summary>

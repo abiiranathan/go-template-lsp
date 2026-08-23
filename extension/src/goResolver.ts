@@ -60,7 +60,7 @@ export interface ResolveResult {
     /** Absolute path to the resolved go binary, or null if none was found. */
     binaryPath: string | null;
     /** Which resolution strategy produced the result, for diagnostics and tests. */
-    source: 'configured' | 'path' | 'known-location' | 'goroot' | 'not-found';
+    source: 'configured' | 'path' | 'login-shell' | 'known-location' | 'goroot' | 'not-found';
 }
 
 /**
@@ -116,18 +116,30 @@ export class GoResolver {
      */
     private knownCandidates(): string[] {
         if (this.platform === 'win32') {
+            const userProfile = this.env.USERPROFILE ?? '';
             return [
                 'C:\\Go\\bin\\go.exe',
                 path.win32.join(this.env.LOCALAPPDATA ?? '', 'Programs', 'Go', 'bin', 'go.exe'),
                 path.win32.join(this.env.ProgramFiles ?? 'C:\\Program Files', 'Go', 'bin', 'go.exe'),
+                // Scoop / user-local installs
+                path.win32.join(userProfile, 'scoop', 'apps', 'go', 'current', 'bin', 'go.exe'),
+                path.win32.join(userProfile, 'go', 'bin', 'go.exe'),
             ];
         }
+        const home = this.env.HOME ?? '';
         return [
             '/usr/local/go/bin/go',   // official Go tarball install (Linux/macOS)
             '/opt/homebrew/bin/go',   // Homebrew on Apple Silicon
             '/usr/local/bin/go',      // Homebrew on Intel Mac / some Linux distros
             '/usr/bin/go',            // Linux distro packages (apt/dnf/pacman)
             '/snap/bin/go',           // Go installed via snap
+            '/home/linuxbrew/.linuxbrew/bin/go', // Homebrew on Linux
+            // Version-manager shims (PATH for these is usually only set in
+            // interactive shell RC files the extension host never sources).
+            path.posix.join(home, '.asdf', 'shims', 'go'),
+            path.posix.join(home, '.local', 'share', 'mise', 'shims', 'go'),
+            path.posix.join(home, '.goenv', 'shims', 'go'),
+            path.posix.join(home, 'go', 'bin', 'go'),
         ];
     }
 
@@ -143,11 +155,15 @@ export class GoResolver {
      * Resolution order:
      *   1. `configuredPath` passed to the constructor, if it exists on disk.
      *   2. `which go` / `where go` against the current process env.
-     *   3. Common OS-specific install locations.
-     *   4. `$GOROOT/bin/go`, if GOROOT is set in the given env.
+     *   3. The user's login shell, asked directly for go's location
+     *      (`$SHELL -lic 'command -v go'`) — this sees version-manager
+     *      shims and profile PATH edits the extension host cannot.
+     *   4. Common OS-specific install locations.
+     *   5. `$GOROOT/bin/go`, if GOROOT is set in the given env.
      *
-     * Result is cached; pass `forceRefresh: true` to bypass the cache
-     * (e.g. after the user edits a configured path or installs Go).
+     * Successful results are cached; failures are NOT cached so a retry
+     * (e.g. after the user installs Go) re-probes instead of replaying a
+     * stale negative result. Pass `forceRefresh: true` to bypass the cache.
      */
     async resolveGoBinary(forceRefresh = false): Promise<ResolveResult> {
         if (!forceRefresh && this.cached !== undefined) {
@@ -173,7 +189,27 @@ export class GoResolver {
             this.log(`'which/where go' failed against process PATH: ${err}`);
         }
 
-        // 3. Common install locations.
+        // 3. Ask the user's login shell. GUI-launched extension hosts do not
+        // source .zprofile/.bashrc/.zshrc, which is where version managers
+        // and custom toolchains add themselves to PATH.
+        if (this.platform !== 'win32') {
+            try {
+                const shell = this.env.SHELL || '/bin/bash';
+                const { stdout } = await this.exec(
+                    `${shell} -lic 'command -v go'`,
+                    { env: this.env, timeout: 8000 }
+                );
+                const resolved = stdout.trim().split(/\r?\n/)[0]?.trim();
+                if (resolved && this.fs.existsSync(resolved)) {
+                    this.log(`Resolved go binary via login shell (${shell}): ${resolved}`);
+                    return this.remember({ binaryPath: resolved, source: 'login-shell' });
+                }
+            } catch (err) {
+                this.log(`Login shell probe for go failed: ${err}`);
+            }
+        }
+
+        // 4. Common install locations.
         for (const candidate of this.knownCandidates()) {
             if (candidate && this.fs.existsSync(candidate)) {
                 this.log(`Resolved go binary via known install location: ${candidate}`);
@@ -181,7 +217,7 @@ export class GoResolver {
             }
         }
 
-        // 4. GOROOT, if defined.
+        // 5. GOROOT, if defined.
         const goroot = this.env.GOROOT;
         if (goroot) {
             const platformPath = this.platform === 'win32' ? path.win32 : path.posix;
@@ -193,7 +229,8 @@ export class GoResolver {
         }
 
         this.log('Could not resolve the go binary through any known method.');
-        return this.remember({ binaryPath: null, source: 'not-found' });
+        // Do NOT cache the failure — a later retry must re-probe.
+        return { binaryPath: null, source: 'not-found' };
     }
 
     private remember(result: ResolveResult): ResolveResult {

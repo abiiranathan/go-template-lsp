@@ -15,6 +15,7 @@ import * as vscode from 'vscode';
 import { TemplateNode } from './types';
 import { TemplateParser } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
+import { findOpenDocument, findTemplateNameAtPosition } from './scopeUtils';
 
 export class ReferenceProvider {
     private readonly parser: TemplateParser;
@@ -61,46 +62,8 @@ export class ReferenceProvider {
         nodes: TemplateNode[],
         position: vscode.Position
     ): string | null {
-        for (const node of nodes) {
-            if (
-                (node.kind === 'partial' || node.kind === 'block' || node.kind === 'define') &&
-                (node.partialName || node.blockName)
-            ) {
-                const name = (node.partialName || node.blockName)!;
-
-                // Locate the quoted name inside the raw tag text, e.g.
-                //   {{ template "my-block" . }}
-                //            ^^^^^^^^^^^
-                const quoteIndex = node.rawText.indexOf(`"${name}"`);
-                if (quoteIndex === -1) continue;
-
-                // quoteIndex is relative to the start of rawText.
-                // node.col is 1-based, so the absolute start column of the opening
-                // quote is:  (node.col - 1) + quoteIndex
-                // The name itself starts one character later (after the opening quote).
-                const nameStartCol = (node.col - 1) + quoteIndex + 1;
-                const nameEndCol = nameStartCol + name.length;
-                const nodeLine = node.line - 1; // convert to 0-based
-
-                if (
-                    position.line === nodeLine &&
-                    position.character >= nameStartCol &&
-                    position.character <= nameEndCol
-                ) {
-                    return name;
-                }
-            }
-
-            if (node.children) {
-                const found = this.findBlockNameAtPosition(node.children, position);
-                if (found) return found;
-            }
-            if (node.elseChildren) {
-                const found = this.findBlockNameAtPosition(node.elseChildren, position);
-                if (found) return found;
-            }
-        }
-        return null;
+        // Shared implementation (also used by Hover/Definition providers).
+        return findTemplateNameAtPosition(nodes, position);
     }
 
     // ── Reference search ──────────────────────────────────────────────────────
@@ -129,14 +92,12 @@ export class ReferenceProvider {
         }
 
         for (const filePath of filePaths) {
-            if (!fs.existsSync(filePath)) continue;
-
             let content: string;
             try {
-                const openDoc = vscode.workspace.textDocuments.find(
-                    d => d.uri.fsPath === filePath
-                );
-                content = openDoc ? openDoc.getText() : fs.readFileSync(filePath, 'utf8');
+                const openDoc = findOpenDocument(filePath);
+                // Prefer async reads: this loop can touch every known template
+                // and sync I/O here stalls the extension-host thread.
+                content = openDoc ? openDoc.getText() : (await fs.promises.readFile(filePath, 'utf8'));
             } catch {
                 continue;
             }

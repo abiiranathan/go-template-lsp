@@ -11,7 +11,7 @@ import {
 import { TemplateParser, resolvePath, ResolveResult } from './templateParser';
 import { KnowledgeGraphBuilder } from './knowledgeGraph';
 import { inferExpressionType, TypeResult } from './compiler/expressionParser';
-import { ScopeUtils } from './scopeUtils';
+import { ScopeUtils, findTemplateNameAtPosition } from './scopeUtils';
 import { GoAnalyzer } from './analyzer';
 
 export class HoverProvider {
@@ -221,7 +221,14 @@ export class HoverProvider {
                 inQuote = true;
                 quoteChar = ch;
                 strStart = i;
-            } else if (inQuote && ch === quoteChar && text[i - 1] !== '\\') {
+            } else if (inQuote && ch === quoteChar) {
+                // Count preceding backslashes: an escaped quote ("\"") does not
+                // close the string, but "\\"" does. Backticks are raw strings in
+                // Go and never contain escapes.
+                let backslashes = 0;
+                for (let j = i - 1; j >= 0 && text[j] === '\\'; j--) backslashes++;
+                if (quoteChar !== '`' && backslashes % 2 === 1) continue;
+
                 inQuote = false;
                 const strEnd = i + 1;
                 if (offset >= strStart && offset <= strEnd) {
@@ -379,33 +386,8 @@ export class HoverProvider {
         nodes: TemplateNode[],
         position: vscode.Position
     ): string | null {
-        for (const node of nodes) {
-            if (
-                (node.kind === 'partial' || node.kind === 'block' || node.kind === 'define') &&
-                (node.partialName || node.blockName)
-            ) {
-                const name = node.partialName || node.blockName!;
-                const nameMatch = node.rawText.match(
-                    new RegExp(`\\{\\{\\s*(template|block|define)\\s+"([^"]+)"`)
-                );
-                if (nameMatch && nameMatch[2] === name) {
-                    const nameStartCol =
-                        (node.col - 1) + node.rawText.indexOf('"' + name + '"') + 1;
-                    if (
-                        position.line === node.line - 1 &&
-                        position.character >= nameStartCol &&
-                        position.character <= nameStartCol + name.length
-                    ) {
-                        return name;
-                    }
-                }
-            }
-            if (node.children) {
-                const found = this.findTemplateNameHover(node.children, position);
-                if (found) return found;
-            }
-        }
-        return null;
+        // Shared implementation (also used by Definition/Reference providers).
+        return findTemplateNameAtPosition(nodes, position);
     }
 
     private buildFuncMapHover(fn: FuncMapInfo): vscode.Hover {

@@ -127,6 +127,71 @@ describe('GoResolver.resolveGoBinary', () => {
         expect(result).toEqual({ binaryPath: null, source: 'not-found' });
     });
 
+    it('recovers via a login shell when PATH misses version-manager installs', async () => {
+        // GUI-launched VS Code: `which go` fails because asdf/mise shims are
+        // only on PATH inside interactive shells. The login-shell probe asks
+        // $SHELL directly.
+        const resolver = new GoResolver({
+            fs: fakeFs(['/home/user/.asdf/shims/go']),
+            exec: fakeExec({
+                'which go': new Error('/bin/sh: 1: which: not found'),
+                "/bin/zsh -lic 'command -v go'": '/home/user/.asdf/shims/go\n',
+            }),
+            env: { SHELL: '/bin/zsh' },
+            platform: 'posix',
+        });
+
+        const result = await resolver.resolveGoBinary();
+
+        expect(result).toEqual({ binaryPath: '/home/user/.asdf/shims/go', source: 'login-shell' });
+    });
+
+    it('finds version-manager shims via known locations without any exec', async () => {
+        const resolver = new GoResolver({
+            fs: fakeFs(['/home/user/.local/share/mise/shims/go']),
+            exec: fakeExec({}),
+            env: { HOME: '/home/user' },
+            platform: 'posix',
+        });
+
+        const result = await resolver.resolveGoBinary();
+
+        expect(result).toEqual({
+            binaryPath: '/home/user/.local/share/mise/shims/go',
+            source: 'known-location',
+        });
+    });
+
+    it('does NOT cache a failed resolution — retries re-probe after Go is installed', async () => {
+        // Regression guard for the stale negative cache: first lookup runs
+        // before Go exists; a later retry must actually probe again instead
+        // of replaying the cached not-found.
+        let goInstalled = false;
+        const dynamicExec: ExecFn = (async (command: string) => {
+            if (command === 'which go') {
+                if (!goInstalled) throw new Error('not found');
+                return { stdout: '/usr/local/go/bin/go\n', stderr: '' };
+            }
+            throw new Error(`command not found: ${command}`);
+        }) as ExecFn;
+
+        const resolver = new GoResolver({
+            fs: {
+                existsSync: (p) => p === '/usr/local/go/bin/go' && goInstalled,
+            },
+            exec: dynamicExec,
+            env: {},
+            platform: 'posix',
+        });
+
+        const before = await resolver.resolveGoBinary();
+        expect(before.binaryPath).toBeNull();
+
+        goInstalled = true;
+        const after = await resolver.resolveGoBinary();
+        expect(after).toEqual({ binaryPath: '/usr/local/go/bin/go', source: 'path' });
+    });
+
     it('caches the result and does not re-invoke exec on a second call', async () => {
         const exec = fakeExec({ 'which go': '/usr/local/go/bin/go\n' }) as ExecFn & { calls: string[] };
         const resolver = new GoResolver({

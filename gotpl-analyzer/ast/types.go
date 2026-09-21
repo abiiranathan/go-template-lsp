@@ -153,6 +153,15 @@ type AnalysisConfig struct {
 	// (e.g., ["Context", "Ctx", "fiber.Ctx", "gin.Context", "echo.Context"]).
 	ContextTypeNames []string `json:"contextTypeNames"`
 
+	// ExcludePackages lists Go package paths or names whose Render/Set calls
+	// should be ignored. This handles non-template Render methods (e.g. a PDF
+	// library with Render(string, map)) that would otherwise produce false
+	// "missing template" errors. Entries may be full import paths
+	// ("github.com/foo/pdf"), path suffixes ("foo/pdf"), or plain package
+	// names ("pdf"). Matching is exact or suffix-based on the import path,
+	// plus exact match on the package name.
+	ExcludePackages []string `json:"excludePackages"`
+
 	// GlobalTemplateName is the special key used in the context file to define global template variables (default: "global").
 	GlobalTemplateName string `json:"globalTemplateName"`
 }

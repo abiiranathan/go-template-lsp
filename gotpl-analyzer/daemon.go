@@ -81,6 +81,9 @@ type daemonAnalyzeParams struct {
 
 	// List of Go type names representing the web context receiver.
 	ContextTypeNames []string `json:"contextTypeNames,omitempty"`
+
+	// ExcludePackages lists package paths or names whose Render/Set calls are ignored.
+	ExcludePackages []string `json:"excludePackages,omitempty"`
 }
 
 // daemonValidateTemplateParams holds the parameters for the "validateTemplate" RPC method.
@@ -459,6 +462,9 @@ func (p daemonAnalyzeParams) toAnalysisConfig() *ast.AnalysisConfig {
 	}
 	if len(p.ContextTypeNames) > 0 {
 		cfg.ContextTypeNames = p.ContextTypeNames
+	}
+	if len(p.ExcludePackages) > 0 {
+		cfg.ExcludePackages = p.ExcludePackages
 	}
 	return &cfg
 }

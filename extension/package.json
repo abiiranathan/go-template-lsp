@@ -176,6 +176,14 @@
             "echo.Context"
           ],
           "description": "List of Go type names representing the web context receiver."
+        },
+        "gotpl.excludePackages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "List of Go package paths or names whose Render/Set calls should be ignored (e.g. PDF libraries with a non-template Render method). Entries may be full import paths (\"github.com/foo/pdf\"), path suffixes (\"foo/pdf\"), or plain package names (\"pdf\")."
         }
       }
     }

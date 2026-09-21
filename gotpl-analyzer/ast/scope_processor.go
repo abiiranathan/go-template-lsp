@@ -306,7 +306,13 @@ func processCallExpr(
 	scope *FuncScope,
 	stringAssignments map[string][]string,
 ) {
-	if isRenderCall(call, config) {
+	// Skip calls from explicitly excluded packages (e.g. non-template
+	// Render methods on PDF or image libraries).
+	if isPackageExcluded(call, info, config) {
+		return
+	}
+
+	if isRenderCall(call, config, info) {
 		if resolved := resolveRenderCall(call, info, stringAssignments); resolved != nil {
 			scope.RenderNodes = append(scope.RenderNodes, *resolved)
 		}

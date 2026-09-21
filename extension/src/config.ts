@@ -88,6 +88,10 @@ class Config {
             'Context', 'fiber.Ctx', 'gin.Context', 'c.HTML', 'echo.Context',
         ];
     }
+
+    excludePackages(): string[] {
+        return this.get<string[]>('excludePackages') ?? [];
+    }
 }
 
 export const config = new Config();

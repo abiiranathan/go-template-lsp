@@ -142,8 +142,14 @@ func resolveTemplateName(
 }
 
 // isRenderCall checks if a call expression matches known template render functions
-// based on configured function names.
-func isRenderCall(call *goast.CallExpr, config *AnalysisConfig) bool {
+// based on configured function names. Calls from excluded packages are ignored.
+func isRenderCall(call *goast.CallExpr, config *AnalysisConfig, info *types.Info) bool {
+	if call == nil {
+		return false
+	}
+	if config != nil && isPackageExcluded(call, info, config) {
+		return false
+	}
 	funcName := ""
 
 	switch fn := call.Fun.(type) {
@@ -158,7 +164,11 @@ func isRenderCall(call *goast.CallExpr, config *AnalysisConfig) bool {
 	}
 
 	// Check configured names list
-	if len(config.RenderFunctionNames) > 0 && slices.Contains(config.RenderFunctionNames, funcName) {
+	names := DefaultConfig.RenderFunctionNames
+	if config != nil && len(config.RenderFunctionNames) > 0 {
+		names = config.RenderFunctionNames
+	}
+	if slices.Contains(names, funcName) {
 		return true
 	}
 

@@ -29,6 +29,11 @@ func InvalidateCache() {
 func AnalyzeDir(dir string, contextFile string, config *AnalysisConfig) AnalysisResult {
 	ClearTypeCache()
 
+	if config == nil {
+		cfg := DefaultConfig
+		config = &cfg
+	}
+
 	result := AnalysisResult{}
 	fset := token.NewFileSet()
 

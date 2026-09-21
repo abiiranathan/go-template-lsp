@@ -130,7 +130,14 @@ Customize the extension behavior in your VS Code `settings.json`:
     "fiber.Ctx",
     "gin.Context",
     "echo.Context"
-  ]
+  ],
+
+  // List of Go package paths or names whose Render/Set calls should be ignored.
+  // Use this for non-template Render methods (e.g. a PDF library with
+  // Render(string, map)) that would otherwise produce false missing-template errors.
+  // Entries may be full import paths ("github.com/foo/pdf"), path suffixes ("foo/pdf"),
+  // or plain package names ("pdf").
+  "gotpl.excludePackages": []
 }
 ```
 
@@ -167,6 +174,8 @@ Usage of gotpl-analyzer:
         Comma-separated list of context setter method names (e.g. Set,Locals)
   -context-types string
         Comma-separated list of context type names (e.g. Context,Ctx,fiber.Ctx,gin.Context)
+  -exclude-pkgs string
+        Comma-separated list of package paths or names to ignore for render detection (e.g. pdf,github.com/foo/pdf)
   -compress
         Output gzip-compressed JSON responses
   -daemon

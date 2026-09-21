@@ -86,6 +86,7 @@ func main() {
 	renderFuncsFlag := flag.String("render-funcs", "", "Comma-separated list of render function names (e.g. Render,HTML,ExecuteTemplate)")
 	setFuncsFlag := flag.String("set-funcs", "", "Comma-separated list of context setter names (e.g. Set,Locals)")
 	contextTypesFlag := flag.String("context-types", "", "Comma-separated list of context types (e.g. Context,fiber.Ctx,gin.Context)")
+	excludePkgsFlag := flag.String("exclude-pkgs", "", "Comma-separated list of package paths or names to ignore for render detection (e.g. pdf,github.com/foo/pdf)")
 	flag.Parse()
 
 	// Print ONLY the version and exit.
@@ -120,6 +121,9 @@ func main() {
 	}
 	if *contextTypesFlag != "" {
 		analysisConfig.ContextTypeNames = splitAndTrim(*contextTypesFlag, ",")
+	}
+	if *excludePkgsFlag != "" {
+		analysisConfig.ExcludePackages = splitAndTrim(*excludePkgsFlag, ",")
 	}
 
 	// Run static analysis on the source directory.

@@ -270,6 +270,7 @@ export class GoAnalyzer {
     const renderFunctionNames = config.renderFunctionNames();
     const setFunctionNames = config.setFunctionNames();
     const contextTypeNames = config.contextTypeNames();
+    const excludePackages = config.excludePackages();
 
     // Resolve the Go source directory to an absolute path
     const absSourceDir = path.resolve(workspaceRoot, sourceDir);
@@ -283,6 +284,7 @@ export class GoAnalyzer {
       renderFunctionNames,
       setFunctionNames,
       contextTypeNames,
+      excludePackages,
     };
   }
 
@@ -296,6 +298,7 @@ export class GoAnalyzer {
     const renderFunctionNames = config.renderFunctionNames();
     const setFunctionNames = config.setFunctionNames();
     const contextTypeNames = config.contextTypeNames();
+    const excludePackages = config.excludePackages();
 
     this.outputChannel.appendLine(`SourceDir: ${sourceDir}`)
     this.outputChannel.appendLine(`templateRoot: ${templateRoot}`)
@@ -344,6 +347,9 @@ export class GoAnalyzer {
     }
     if (contextTypeNames.length > 0) {
       args.push('-context-types', contextTypeNames.join(','));
+    }
+    if (excludePackages.length > 0) {
+      args.push('-exclude-pkgs', excludePackages.join(','));
     }
 
     this.outputChannel.appendLine(`[Analyzer] Running: ${this.analyzerPath} ${args.join(' ')}`);

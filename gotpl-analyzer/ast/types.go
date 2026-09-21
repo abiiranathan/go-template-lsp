@@ -155,11 +155,15 @@ type AnalysisConfig struct {
 
 	// ExcludePackages lists Go package paths or names whose Render/Set calls
 	// should be ignored. This handles non-template Render methods (e.g. a PDF
-	// library with Render(string, map)) that would otherwise produce false
-	// "missing template" errors. Entries may be full import paths
-	// ("github.com/foo/pdf"), path suffixes ("foo/pdf"), or plain package
-	// names ("pdf"). Matching is exact or suffix-based on the import path,
-	// plus exact match on the package name.
+	// library with Render(string, map), or lipgloss Style.Render calls) that
+	// would otherwise produce false "missing template" errors. Entries may be
+	// full import paths ("github.com/foo/pdf"), path suffixes ("foo/pdf"),
+	// plain package names ("pdf"), or caller-side directories relative to the
+	// analysis root ("internal/tui" ignores render-like calls located in that
+	// directory, regardless of which package defines the method). Callee
+	// matching is exact or suffix-based on the import path, plus exact match
+	// on the package name; caller matching is exact or prefix-based on the
+	// relative file path, plus segment match on bare directory names.
 	ExcludePackages []string `json:"excludePackages"`
 
 	// GlobalTemplateName is the special key used in the context file to define global template variables (default: "global").

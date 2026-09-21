@@ -94,6 +94,93 @@ func TestExcludePackagesIgnoresNonTemplateRender(t *testing.T) {
 	}
 }
 
+func TestExcludePackagesIgnoresCallerDirectory(t *testing.T) {
+	// A call to web.Ctx.Render located in tui/ must be dropped by excluding
+	// the caller directory, even though the callee package (web) is kept.
+	tmpDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/callertest\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "web"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "tui"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	webSrc := `package web
+
+type Ctx struct{}
+
+func (c *Ctx) Render(name string, data map[string]any) error { return nil }
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "web", "web.go"), []byte(webSrc), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tuiSrc := `package tui
+
+import "example.com/callertest/web"
+
+func handler(c *web.Ctx) {
+	c.Render("tui.html", map[string]any{"Title": "hi"})
+}
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "tui", "tui.go"), []byte(tuiSrc), 0644); err != nil {
+		t.Fatal(err)
+	}
+	rootSrc := `package main
+
+import "example.com/callertest/web"
+
+func webHandler(c *web.Ctx) {
+	c.Render("index.html", map[string]any{"Title": "hi"})
+}
+`
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte(rootSrc), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	base := DefaultConfig
+	found := collectTemplates(AnalyzeDir(tmpDir, "", &base).RenderCalls)
+	if !found["index.html"] || !found["tui.html"] {
+		t.Fatalf("expected baseline to include index.html and tui.html, got %v", found)
+	}
+
+	for _, entry := range []string{"tui", "example.com/callertest/tui"} {
+		cfg := DefaultConfig
+		cfg.ExcludePackages = []string{entry}
+		found = collectTemplates(AnalyzeDir(tmpDir, "", &cfg).RenderCalls)
+		if !found["index.html"] {
+			t.Errorf("entry %q: expected index.html to survive, got %v", entry, found)
+		}
+		if found["tui.html"] {
+			t.Errorf("entry %q: expected tui.html to be excluded by caller dir, got %v", entry, found)
+		}
+	}
+}
+
+func TestMatchesExcludedCaller(t *testing.T) {
+	cases := []struct {
+		relFile, exclude string
+		want             bool
+	}{
+		{"internal/tui/app.go", "internal/tui", true},
+		{"internal/tui/app.go", "tui", true},
+		{"internal/tui/app.go", "github.com/abiiranathan/eclinichms/internal/tui", true},
+		{"internal/tui/app.go", "internal", true},
+		{"internal/tui/app.go", "internal/tui/app.go", true},
+		{"internal/tui/app.go", "other", false},
+		{"internal/tui/app.go", "tu", false}, // no partial-segment match
+		{"main.go", "main.go", true},
+		{"main.go", "other", false},
+	}
+	for _, tc := range cases {
+		if got := matchesExcludedCaller(tc.relFile, []string{tc.exclude}); got != tc.want {
+			t.Errorf("matchesExcludedCaller(%q,[%q]) = %v, want %v", tc.relFile, tc.exclude, got, tc.want)
+		}
+	}
+}
+
 func TestMatchesExcludedPackage(t *testing.T) {
 	cases := []struct {
 		path, name, exclude string

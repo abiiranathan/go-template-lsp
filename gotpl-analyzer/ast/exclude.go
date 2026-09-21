@@ -3,6 +3,7 @@ package ast
 import (
 	goast "go/ast"
 	"go/types"
+	"path/filepath"
 	"strings"
 )
 
@@ -130,6 +131,66 @@ func namedTypePackage(t types.Type) (path, name string) {
 		return pkg.Path(), pkg.Name()
 	}
 	return "", ""
+}
+
+// matchesExcludedCaller reports whether a caller file (path relative to the
+// analysis root, e.g. "internal/tui/app.go") matches any entry in the exclude
+// list. This covers the case where the user wants to ignore render-like calls
+// *located in* certain packages/directories, regardless of which package
+// defines the called method (e.g. lipgloss Style.Render calls inside
+// internal/tui).
+//
+// An entry matches when:
+//   - it equals the slashified relative file path, or is a directory prefix
+//     of it ("internal/tui" matches "internal/tui/app.go");
+//   - it equals the file's directory or is a suffix of it, so full import
+//     paths work ("example.com/mod/internal/tui" matches dir "internal/tui");
+//   - it is a plain name (no "/") equal to any path segment, so bare package
+//     dir names work ("tui" matches "internal/tui/app.go").
+//
+// Empty entries are ignored.
+func matchesExcludedCaller(relFile string, excludes []string) bool {
+	slash := filepath.ToSlash(relFile)
+	if slash == "" {
+		return false
+	}
+	// Directory portion of the caller file ("internal/tui" for
+	// "internal/tui/app.go"; "." for root-level files).
+	dir := slash
+	if i := strings.LastIndex(slash, "/"); i >= 0 {
+		dir = slash[:i]
+	} else {
+		dir = ""
+	}
+
+	for _, e := range excludes {
+		ex := strings.Trim(filepath.ToSlash(strings.TrimSpace(e)), "/")
+		if ex == "" {
+			continue
+		}
+		// Exact file match or directory-prefix match.
+		if slash == ex || strings.HasPrefix(slash, ex+"/") {
+			return true
+		}
+		if dir == "" {
+			continue
+		}
+		// Directory match: exact, entry-is-suffix (full import path given),
+		// or dir-is-suffix (relative sub-path given, e.g. "tui" vs
+		// "internal/tui" handled below via segments).
+		if dir == ex || strings.HasSuffix(ex, "/"+dir) || strings.HasSuffix(dir, "/"+ex) {
+			return true
+		}
+		// Plain name matches any single path segment.
+		if !strings.Contains(ex, "/") {
+			for _, seg := range strings.Split(dir, "/") {
+				if seg == ex {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // matchesExcludedPackage reports whether pkgPath or pkgName matches any entry

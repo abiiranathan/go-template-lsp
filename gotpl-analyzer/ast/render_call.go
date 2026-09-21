@@ -22,6 +22,7 @@ func generateRenderCalls(
 	structIndex map[string]structIndexEntry,
 	fc *fieldCache,
 	seenPool *seenMapPool,
+	config *AnalysisConfig,
 ) []RenderCall {
 	// Pre-count total render calls for efficient allocation
 	totalRenders := 0
@@ -48,6 +49,17 @@ func generateRenderCalls(
 			}
 
 			templatePathExpr := call.Args[templateArgIdx]
+
+			// Skip render-like calls located in explicitly excluded
+			// packages/directories (e.g. lipgloss Style.Render calls inside
+			// internal/tui). The callee-side check in processCallExpr covers
+			// the defining package; this covers the caller side.
+			if config != nil && len(config.ExcludePackages) > 0 {
+				pos := fset.Position(call.Pos())
+				if matchesExcludedCaller(resolveRelativePath(pos.Filename, dir), config.ExcludePackages) {
+					continue
+				}
+			}
 
 			// Calculate precise column range for template name
 			tplNameStartCol, tplNameEndCol := getExprColumnRange(fset, templatePathExpr)

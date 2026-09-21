@@ -134,9 +134,12 @@ Customize the extension behavior in your VS Code `settings.json`:
 
   // List of Go package paths or names whose Render/Set calls should be ignored.
   // Use this for non-template Render methods (e.g. a PDF library with
-  // Render(string, map)) that would otherwise produce false missing-template errors.
+  // Render(string, map), or lipgloss Style.Render calls) that would otherwise
+  // produce false missing-template errors.
   // Entries may be full import paths ("github.com/foo/pdf"), path suffixes ("foo/pdf"),
-  // or plain package names ("pdf").
+  // plain package names ("pdf"), or caller-side directories relative to the
+  // analysis root ("internal/tui" ignores render-like calls located in that
+  // directory, regardless of which package defines the method).
   "gotpl.excludePackages": []
 }
 ```

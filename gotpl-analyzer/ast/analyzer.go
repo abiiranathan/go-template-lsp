@@ -74,7 +74,7 @@ func AnalyzeDir(dir string, contextFile string, config *AnalysisConfig) Analysis
 	globalImplicitVars := extractGlobalImplicitVars(scopes)
 
 	// Generate render calls
-	result.RenderCalls = generateRenderCalls(scopes, globalImplicitVars, info, fset, dir, structIndex, fc, seenPool)
+	result.RenderCalls = generateRenderCalls(scopes, globalImplicitVars, info, fset, dir, structIndex, fc, seenPool, config)
 
 	// Aggregate template function maps
 	result.FuncMaps = aggregateFuncMaps(scopes)

@@ -99,15 +99,21 @@ export class CompletionProvider {
      * outside any action.
      *
      * Uses the whole document up to the cursor so multi-line actions are handled,
-     * unlike a line-local scan.
+     * unlike a line-local scan. A closing '}}' only counts when it ends at or
+     * before the cursor, otherwise typing '.' in '{{.}}' would see the trailing
+     * '}}' (which starts at the cursor) and treat the action as already closed.
+     * Go templates ignore whitespace, so '{{.}}' must behave like '{{ . }}'.
      */
     private isInsideAction(document: vscode.TextDocument, position: vscode.Position): boolean {
         const content = document.getText();
         const offset = document.offsetAt(position);
         const open = content.lastIndexOf('{{', offset);
         if (open === -1) return false;
-        const close = content.lastIndexOf('}}', offset);
-        return open > close;
+
+        // Search ending at offset-2 so a match is fully before the cursor.
+        const closeStart = offset >= 2 ? content.lastIndexOf('}}', offset - 2) : -1;
+        const closeEnd = closeStart === -1 ? -1 : closeStart + 2;
+        return open >= closeEnd;
     }
 
     private async getComplexExpressionCompletions(

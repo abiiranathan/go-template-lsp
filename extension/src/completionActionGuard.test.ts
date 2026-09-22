@@ -105,6 +105,33 @@ test('completion still works inside an action', () => {
     expect(fieldItems.map(i => i.label)).toContain('Name');
 });
 
+test('whitespace is optional inside an action', () => {
+    const provider = makeProvider();
+
+    // {{.}} — cursor right after the dot, before the closing braces.
+    const tight = '{{.}}';
+    const items = provider.getCompletions(makeDocument(tight), { line: 0, character: 3 } as any, ctx);
+    expect(items.map(i => i.label)).toEqual(expect.arrayContaining(['Title', 'user']));
+
+    // {{.user.}} — tight dot-path.
+    const tightPath = '{{.user.}}';
+    const fieldItems = provider.getCompletions(makeDocument(tightPath), { line: 0, character: 8 } as any, ctx);
+    expect(fieldItems.map(i => i.label)).toContain('Name');
+
+    // {{$ — tight dollar local/global (no space, not yet closed).
+    const tightDollar = '{{$';
+    const dollarItems = provider.getCompletions(makeDocument(tightDollar), { line: 0, character: 3 } as any, ctx);
+    expect(dollarItems.map(i => i.label)).toEqual(expect.arrayContaining(['Title', 'user']));
+
+    // Typing just "{{." (no closing braces yet) must still complete.
+    const open = '{{.';
+    const openItems = provider.getCompletions(makeDocument(open), { line: 0, character: 3 } as any, ctx);
+    expect(openItems.map(i => i.label)).toEqual(expect.arrayContaining(['Title', 'user']));
+
+    // Cursor after the action has fully closed → no template items.
+    expect(provider.getCompletions(makeDocument(tight), { line: 0, character: 5 } as any, ctx)).toEqual([]);
+});
+
 test('multi-line action is recognised as inside', () => {
     const provider = makeProvider();
     const content = '{{ printf\n  . }}';

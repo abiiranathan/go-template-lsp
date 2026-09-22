@@ -100,6 +100,68 @@ func TestPropagatedRenderVarIndexInsideRange(t *testing.T) {
 	}
 }
 
+// TestInlineBlockContextDoesNotLeakIntoRenderedFile verifies that an inline
+// named block called with a narrowed "." context (e.g. "." = Drug from inside
+// {{ range .billedDrugs }}) does not leak that context into the root variables
+// of the file that defines it. Only the block's own entry should carry the
+// element type; the rendered file must keep its render-call root vars.
+func TestInlineBlockContextDoesNotLeakIntoRenderedFile(t *testing.T) {
+	pageContent := `
+		{{ range .billedDrugs }}
+			{{ template "billed-drug" . }}
+		{{ end }}
+
+		{{ block "billed-drug" . }}
+			<div>{{ .Name }}</div>
+		{{ end }}
+	`
+	store := validator.TemplateStore{
+		filepath.Join(".", "page.html"): pageContent,
+	}
+
+	renderCalls := []ast.RenderCall{
+		{
+			File:     "handler.go",
+			Line:     1,
+			Template: "page.html",
+			Vars: []ast.TemplateVar{
+				{
+					Name:     "billedDrugs",
+					TypeStr:  "[]handlers.Drug",
+					IsSlice:  true,
+					ElemType: "handlers.Drug",
+					Fields:   []ast.FieldInfo{{Name: "Name", TypeStr: "string"}},
+				},
+			},
+		},
+	}
+
+	namedBlocks, _ := validator.ParseAllNamedTemplatesFromStore(store, ".", ".")
+	idx := validator.BuildPropagatedRenderVarIndex(renderCalls, namedBlocks, ".", ".", nil, store)
+
+	for _, v := range idx["page.html"] {
+		if v.Name == "." {
+			t.Fatalf("block-local '.' context leaked into rendered file root vars: %#v", idx["page.html"])
+		}
+	}
+
+	// The block itself must still receive the narrowed element context so its
+	// body validates/hovers with Drug.
+	blockVars, ok := idx["billed-drug"]
+	if !ok {
+		t.Fatalf("expected propagated vars for billed-drug block")
+	}
+	foundDot := false
+	for _, v := range blockVars {
+		if v.Name == "." && v.TypeStr == "handlers.Drug" {
+			foundDot = true
+		}
+	}
+	if !foundDot {
+		t.Fatalf("expected billed-drug to receive '.' = handlers.Drug, got %#v", blockVars)
+	}
+}
+
 // TestBlockKeywordNotTreatedAsTemplate verifies that unquoted {{ block "name" . }}
 // does not generate a synthetic template entry named "block".
 func TestBlockKeywordNotTreatedAsTemplate(t *testing.T) {

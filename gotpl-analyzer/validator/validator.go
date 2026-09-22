@@ -173,6 +173,20 @@ func BuildPropagatedRenderVarIndex(
 ) map[string][]ast.TemplateVar {
 	idx := buildRenderVarIndex(renderCalls)
 
+	// Files rendered directly via a file-based render call define their own root
+	// scope. A named block defined inside such a file must not leak its
+	// block-local context into the file's root variable set. Without this guard,
+	// an inline block called with a narrowed context — e.g. "billed-drug" invoked
+	// with "." (Drug) from inside {{ range .billedDrugs }} — would merge
+	// "." = Drug into the file's root vars, making completion/hover at the file
+	// root resolve "." to the block's element type instead of the render context.
+	directlyRenderedFiles := make(map[string]bool, len(renderCalls))
+	for _, rc := range renderCalls {
+		if IsFileBasedPartial(rc.Template) {
+			directlyRenderedFiles[normalizeTemplateKeyRel(rc.Template)] = true
+		}
+	}
+
 	type queueItem struct {
 		name string
 	}
@@ -250,7 +264,7 @@ func BuildPropagatedRenderVarIndex(
 
 			if entries, ok := namedBlocks[targetName]; ok && len(entries) > 0 {
 				relPath := entries[0].TemplatePath
-				if relPath != "" && relPath != targetName {
+				if relPath != "" && relPath != targetName && !directlyRenderedFiles[normalizeTemplateKeyRel(relPath)] {
 					if mergeVarsIntoIndex(idx, relPath, propagatedVars) {
 						changed = true
 					}

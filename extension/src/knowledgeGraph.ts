@@ -177,7 +177,15 @@ export class KnowledgeGraphBuilder {
 
             mergeRenderCall(logicalPath, absPath, rc);
 
-            if (analysisResult.namedBlocks && analysisResult.namedBlocks[logicalPath]) {
+            // A real render call targeting a named block (e.g. c.Render("partial", …))
+            // contributes its context to the block's defining file. Synthetic calls
+            // emitted by the analyzer for block bodies must NOT be merged: their vars
+            // carry the block's narrowed "." context (e.g. "." = Drug for an inline
+            // block called inside {{ range .billedDrugs }}), and merging them into a
+            // directly-rendered file would make the file root resolve "." to the
+            // block element type instead of the render context.
+            const isSyntheticCall = rc.file === 'template-call' || rc.file === 'context-file';
+            if (!isSyntheticCall && analysisResult.namedBlocks && analysisResult.namedBlocks[logicalPath]) {
                 const entries = analysisResult.namedBlocks[logicalPath];
                 if (entries.length > 0) {
                     const entry = entries[0];

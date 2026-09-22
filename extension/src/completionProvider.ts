@@ -70,6 +70,7 @@ export class CompletionProvider {
         position: vscode.Position,
         ctx: TemplateContext
     ): Promise<vscode.CompletionItem[]> {
+        if (!this.isInsideAction(document, position)) return [];
         const complex = await this.getComplexExpressionCompletions(document, position, ctx);
         if (complex) return complex;
         return this.resolveCompletions(document, position, ctx);
@@ -85,7 +86,28 @@ export class CompletionProvider {
         position: vscode.Position,
         ctx: TemplateContext
     ): vscode.CompletionItem[] {
+        if (!this.isInsideAction(document, position)) return [];
         return this.resolveCompletions(document, position, ctx);
+    }
+
+    /**
+     * Reports whether the cursor sits inside a {{ ... }} action. The provider is
+     * registered for the '.', '$' and '"' trigger characters, so VS Code invokes
+     * it on every such keystroke — including in plain HTML/CSS/JS text, where a
+     * literal '.' or '$' is not a template expression. Without this guard those
+     * characters would surface the enclosing scope's fields (or template names)
+     * outside any action.
+     *
+     * Uses the whole document up to the cursor so multi-line actions are handled,
+     * unlike a line-local scan.
+     */
+    private isInsideAction(document: vscode.TextDocument, position: vscode.Position): boolean {
+        const content = document.getText();
+        const offset = document.offsetAt(position);
+        const open = content.lastIndexOf('{{', offset);
+        if (open === -1) return false;
+        const close = content.lastIndexOf('}}', offset);
+        return open > close;
     }
 
     private async getComplexExpressionCompletions(

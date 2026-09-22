@@ -166,9 +166,12 @@ func (h *Handler) RenderTreatmentChart(inpatient bool) rex.HandlerFunc {
 		// Analyzer also detects calls to c.Set and updated the index.
 		c.Set("currentUser", newuser)
 
+		var arr = []string{"Abiira", "Nathan"}
+
 		// Magic happens here. Try renaming template name to something not found!
 		return c.Render("views/inpatient/treatment-chart.html", rex.Map{
 			"management":    management,
+			"array":         arr,
 			"visit":         visit,
 			"Title":         title,
 			"newuser":       newuser,

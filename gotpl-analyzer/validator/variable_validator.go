@@ -152,6 +152,11 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 			return nil
 		}
 		if len(localVar.Fields) == 0 && !localVar.IsMap && !localVar.IsSlice {
+			// A concrete primitive (e.g. the value variable of
+			// {{ range $v := .Strings }}) has no fields, so any field access is invalid.
+			if isConcretePrimitiveType(localVar.TypeStr) && !typeHasMethod(localVar.TypeStr, remainder[0]) {
+				return undefinedVariableError(varExpr)
+			}
 			return nil
 		}
 		return validateNestedFields(varExpr, remainder, localVar.Fields, localVar.TypeStr, localVar.IsMap, localVar.ElemType)
@@ -215,6 +220,13 @@ func validateVariableInScope(varExpr string, scopeStack []ScopeType, varMap map[
 		}
 
 		if len(currentScope.Fields) == 0 {
+			// The scope has no field metadata. If it is a concrete primitive —
+			// e.g. the dot inside {{ range .Strings }} where the element type is
+			// string — no field can ever exist, so report the invalid access.
+			// Genuinely unknown/opaque types stay silent to avoid false positives.
+			if isConcretePrimitiveType(currentScope.TypeStr) && !typeHasMethod(currentScope.TypeStr, fieldName) {
+				return undefinedVariableError(varExpr)
+			}
 			return nil
 		}
 
@@ -374,6 +386,10 @@ func validateNestedFields(fullExpr string, fieldParts []string, fields []ast.Fie
 
 			// If current fields are empty and type is not a known concrete struct, stay silent
 			if len(currentFields) == 0 {
+				// A concrete primitive can never have fields; report the access.
+				if isConcretePrimitiveType(parentType) && !typeHasMethod(parentType, fieldName) {
+					return undefinedVariableError(fullExpr)
+				}
 				return nil
 			}
 
@@ -387,6 +403,28 @@ func validateNestedFields(fullExpr string, fieldParts []string, fields []ast.Fie
 	}
 
 	return nil
+}
+
+// isConcretePrimitiveType reports whether typeStr is a built-in Go scalar type
+// (optionally behind a pointer) that can never expose fields. Unlike
+// isPrimitiveTypeName, it excludes indeterminate types such as any,
+// interface{}, unknown, context and error, for which field access must stay
+// silent because the concrete type is unknown at analysis time.
+func isConcretePrimitiveType(typeStr string) bool {
+	t := strings.TrimSpace(typeStr)
+	for strings.HasPrefix(t, "*") {
+		t = strings.TrimSpace(t[1:])
+	}
+
+	switch t {
+	case "string", "bool", "byte", "rune",
+		"int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr",
+		"float32", "float64", "complex64", "complex128":
+		return true
+	default:
+		return false
+	}
 }
 
 // isIndeterminateType reports true when a type cannot be strictly validated at compile time.

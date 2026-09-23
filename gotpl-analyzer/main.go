@@ -57,7 +57,7 @@ type ValidationOutput struct {
 }
 
 // Version is the fallback version if built from source without module metadata
-var Version = "v0.10.0"
+var Version = "v0.10.1"
 
 func getVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok {
